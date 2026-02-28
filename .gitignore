@@ -1,0 +1,20 @@
+# Credentials - never commit these
+*.json
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Pygame / pygbag build output
+build/
+dist/
+*.egg-info/
+
+# OS files
+.DS_Store
+Thumbs.db
