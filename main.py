@@ -687,9 +687,13 @@ def build_touch_layout(screen_w, screen_h, orientation):
     pad = 16
     base = max(72, int(min(screen_w, screen_h) * 0.11))
     joystick_radius = max(70, int(base * 1.2))
-    attack_radius = max(40, int(base * 0.8))
+    attack_radius = max(48, int(base * 0.95))
     interact_radius = max(38, int(base * 0.68))
     pause_radius = max(24, int(base * 0.45))
+    # Larger invisible tap zones are much more forgiving on phone screens.
+    attack_hit_radius = max(attack_radius + 18, int(attack_radius * 1.45))
+    interact_hit_radius = max(interact_radius + 10, int(interact_radius * 1.20))
+    pause_hit_radius = max(pause_radius + 8, int(pause_radius * 1.25))
 
     if orientation == "portrait":
         joy_center = (pad + joystick_radius, screen_h - pad - joystick_radius - 40)
@@ -713,10 +717,13 @@ def build_touch_layout(screen_w, screen_h, orientation):
         "knob_radius": max(24, int(joystick_radius * 0.40)),
         "attack_center": atk_center,
         "attack_radius": attack_radius,
+        "attack_hit_radius": attack_hit_radius,
         "interact_center": interact_center,
         "interact_radius": interact_radius,
+        "interact_hit_radius": interact_hit_radius,
         "pause_center": pause_center,
         "pause_radius": pause_radius,
+        "pause_hit_radius": pause_hit_radius,
     }
 
 
@@ -796,15 +803,15 @@ class TouchControls:
                 self.move_pointer_id = pointer_id
                 self._set_move_vector_from_pos(pos)
                 return
-            if self._distance_sq(pos, self.layout["attack_center"]) <= self.layout["attack_radius"] ** 2:
+            if self._distance_sq(pos, self.layout["attack_center"]) <= self.layout["attack_hit_radius"] ** 2:
                 self.attack_tapped = True
                 return
             if self.interact_enabled and (
-                self._distance_sq(pos, self.layout["interact_center"]) <= self.layout["interact_radius"] ** 2
+                self._distance_sq(pos, self.layout["interact_center"]) <= self.layout["interact_hit_radius"] ** 2
             ):
                 self.interact_tapped = True
                 return
-            if self._distance_sq(pos, self.layout["pause_center"]) <= self.layout["pause_radius"] ** 2:
+            if self._distance_sq(pos, self.layout["pause_center"]) <= self.layout["pause_hit_radius"] ** 2:
                 self.pause_tapped = True
                 return
 
@@ -842,6 +849,7 @@ class TouchControls:
 
         # Attack button
         pygame.draw.circle(screen, (200, 35, 35), self.layout["attack_center"], self.layout["attack_radius"])
+        pygame.draw.circle(screen, (255, 255, 255), self.layout["attack_center"], self.layout["attack_radius"], 2)
         atk = self.hud_font.render("ATK", True, (255, 255, 255))
         screen.blit(atk, (self.layout["attack_center"][0] - atk.get_width() // 2,
                           self.layout["attack_center"][1] - atk.get_height() // 2))
