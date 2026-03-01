@@ -1,0 +1,499 @@
+"""
+orchestrator.py — The Agent Orchestrator for "The Ancient Wizard's Star"
+
+This script runs the five AI agents that help build the game:
+  1. Story & Design Lead  — writes the story, characters, and quests
+  2. Graphic Designer     — writes the art style guide and sprite specs
+  3. Programmer           — writes Python/Pygame game code
+  4. QA Reviewer          — reviews code for quality and produces git commands
+  5. Sound Designer       — plans every music track and sound effect in the game
+
+Run from the project root with:
+  python agents/orchestrator.py --phase design
+  python agents/orchestrator.py --phase code --file game/player.py
+  python agents/orchestrator.py --phase review
+  python agents/orchestrator.py --phase sound
+  python agents/orchestrator.py --phase all
+"""
+
+import anthropic
+import argparse
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# Path constants — everything is relative to the project root so this script
+# works on any computer, not just dad's machine.
+# ---------------------------------------------------------------------------
+AGENTS_DIR = Path(__file__).parent          # The agents/ folder
+PROJECT_ROOT = AGENTS_DIR.parent            # The Bakuriani Game/ folder
+PROMPTS_DIR = AGENTS_DIR / "prompts"        # Where the agent system prompts live
+OUTPUT_DIR = AGENTS_DIR / "output"          # Where agent outputs are saved
+DOCS_DIR = PROJECT_ROOT / "docs"            # Reviewed & approved design docs
+
+# The AI model all five agents will use
+MODEL = "claude-sonnet-4-6"
+
+# How many words each agent is allowed to write in one response
+# (8096 tokens is roughly 6000 words — plenty for full design docs and code files)
+MAX_TOKENS_STORY = 8096
+MAX_TOKENS_ART = 4096
+MAX_TOKENS_CODE = 8096
+MAX_TOKENS_REVIEW = 4096
+MAX_TOKENS_SOUND = 4096
+
+
+# ---------------------------------------------------------------------------
+# Helper functions — small tools used by all five agents
+# ---------------------------------------------------------------------------
+
+def load_context_file(relative_path: str) -> str:
+    """Read a project file and return its text contents.
+
+    We use this to give each agent the game's design documents to read.
+    If the file doesn't exist yet, we return a friendly message instead of crashing.
+    """
+    full_path = PROJECT_ROOT / relative_path
+    if not full_path.exists():
+        # Let the agent know this file is missing — it can still work without it
+        return f"[File not found: {relative_path} — this may be created in a later phase]"
+    return full_path.read_text(encoding="utf-8")
+
+
+def load_system_prompt(agent_name: str) -> str:
+    """Load the system prompt for an agent from its markdown file.
+
+    Each agent has a file in agents/prompts/ that defines who they are
+    and what rules they follow. This function reads that file.
+    """
+    prompt_file = PROMPTS_DIR / f"{agent_name}.md"
+    if not prompt_file.exists():
+        print(f"ERROR: System prompt not found: {prompt_file}")
+        sys.exit(1)
+    return prompt_file.read_text(encoding="utf-8")
+
+
+def call_agent(
+    agent_name: str,
+    system_prompt: str,
+    user_message: str,
+    max_tokens: int = 8096
+) -> str:
+    """Send a message to one AI agent and get back its response.
+
+    This is the core function — it calls the Anthropic API and returns
+    whatever the agent writes. The ANTHROPIC_API_KEY must be set in the
+    environment (or in a .env file) for this to work.
+    """
+    # Create the Anthropic client — it reads the API key from the environment
+    client = anthropic.Anthropic()
+
+    print(f"\n{'='*60}")
+    print(f"  Running agent: {agent_name}")
+    print(f"  Model: {MODEL}")
+    print(f"  Max tokens: {max_tokens}")
+    print(f"{'='*60}")
+    print("  Sending request... (this may take 30-60 seconds)")
+
+    # Make the actual API call to Claude
+    message = client.messages.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=[
+            {"role": "user", "content": user_message}
+        ]
+    )
+
+    response_text = message.content[0].text
+    print(f"  Done! Received {len(response_text):,} characters.")
+    return response_text
+
+
+def save_output(agent_name: str, content: str, output_filename: str) -> Path:
+    """Save an agent's output to a file so the next agent can read it.
+
+    Outputs land in agents/output/ — dad reviews them there before
+    they get copied to docs/ or game/ (the approved locations).
+    """
+    # Make sure the output folder exists
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    output_path = OUTPUT_DIR / output_filename
+
+    # Add a timestamp header so we know when it was created
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"<!-- Generated by {agent_name} on {timestamp} -->\n\n"
+
+    output_path.write_text(header + content, encoding="utf-8")
+    print(f"\n  Output saved to: {output_path}")
+    return output_path
+
+
+def load_design_doc(filename: str) -> str:
+    """Load a design document, checking the approved docs/ folder first.
+
+    The Programmer and Reviewer agents need the story and art docs.
+    We check docs/ first (dad-reviewed versions), then fall back to
+    agents/output/ (raw drafts) if the reviewed version doesn't exist yet.
+    """
+    # First try the approved version in docs/
+    approved_path = DOCS_DIR / filename
+    if approved_path.exists():
+        print(f"  Loading approved doc: {approved_path}")
+        return approved_path.read_text(encoding="utf-8")
+
+    # Fall back to the draft in agents/output/
+    draft_path = OUTPUT_DIR / filename
+    if draft_path.exists():
+        print(f"  Loading draft doc (not yet reviewed): {draft_path}")
+        return draft_path.read_text(encoding="utf-8")
+
+    # Neither version exists yet — return a placeholder
+    return f"[Design document '{filename}' not yet created — run --phase design first]"
+
+
+# ---------------------------------------------------------------------------
+# Phase runner functions — one per phase of development
+# ---------------------------------------------------------------------------
+
+def run_phase_design(task: str) -> tuple[str, str]:
+    """Run the Design phase: Story Lead then Graphic Designer.
+
+    Both agents read the same game design documents and produce their own
+    output files. The Story Lead goes first, then the Graphic Designer.
+
+    Returns:
+        A tuple of (story_output, art_output) as strings.
+    """
+    print("\n*** PHASE: DESIGN ***")
+    print("Running Story & Design Lead, then Graphic Designer.\n")
+
+    # Load the shared context that both agents need
+    claude_md = load_context_file("CLAUDE.md")
+    game_notes = load_context_file("Game Notes.md")
+    shared_context = (
+        f"## CLAUDE.md — Project Instructions\n\n{claude_md}\n\n"
+        f"## Game Notes.md — Additional Design Notes\n\n{game_notes}"
+    )
+
+    # --- Story & Design Lead ---
+    story_prompt = load_system_prompt("story_lead")
+    story_user_message = (
+        f"{shared_context}\n\n"
+        f"## Your Task\n\n{task}\n\n"
+        f"Write the complete Story & Design Bible for this game."
+    )
+    story_output = call_agent(
+        "Story & Design Lead",
+        story_prompt,
+        story_user_message,
+        max_tokens=MAX_TOKENS_STORY
+    )
+    save_output("Story & Design Lead", story_output, "story_design.md")
+
+    # --- Graphic Designer ---
+    art_prompt = load_system_prompt("graphic_designer")
+    art_user_message = (
+        f"{shared_context}\n\n"
+        f"## Your Task\n\n{task}\n\n"
+        f"Write the complete Art Style Guide for this game."
+    )
+    art_output = call_agent(
+        "Graphic Designer",
+        art_prompt,
+        art_user_message,
+        max_tokens=MAX_TOKENS_ART
+    )
+    save_output("Graphic Designer", art_output, "art_guide.md")
+
+    print("\n*** DESIGN PHASE COMPLETE ***")
+    print("Review the outputs in agents/output/ before moving to coding.")
+    print("Copy approved files to docs/ when you are happy with them.")
+
+    return story_output, art_output
+
+
+def run_phase_code(task: str, target_file: str) -> str:
+    """Run the Programming phase: Programmer writes one game file.
+
+    The Programmer reads the story design doc and art guide before writing
+    code, so the game matches the design intentions.
+
+    Args:
+        task:        A description of what the programmer should focus on.
+        target_file: Which file to write, e.g. "game/player.py" or "main.py"
+
+    Returns:
+        The programmer's output as a string (markdown with code blocks).
+    """
+    print(f"\n*** PHASE: CODE — Writing {target_file} ***")
+
+    # Load all the context the Programmer needs
+    claude_md = load_context_file("CLAUDE.md")
+    story_doc = load_design_doc("story_design.md")
+    art_doc = load_design_doc("art_guide.md")
+
+    programmer_prompt = load_system_prompt("programmer")
+    user_message = (
+        f"## CLAUDE.md — Project Instructions\n\n{claude_md}\n\n"
+        f"## Story & Design Document\n\n{story_doc}\n\n"
+        f"## Art Style Guide\n\n{art_doc}\n\n"
+        f"## Your Task\n\n"
+        f"Write the file: `{target_file}`\n\n"
+        f"{task}"
+    )
+
+    code_output = call_agent(
+        "Programmer",
+        programmer_prompt,
+        user_message,
+        max_tokens=MAX_TOKENS_CODE
+    )
+
+    # Save with a filename that shows which game file was written
+    # e.g. "game/player.py" becomes "game_player.py.md"
+    safe_filename = target_file.replace("/", "_").replace("\\", "_") + ".md"
+    save_output("Programmer", code_output, safe_filename)
+
+    print("\n*** CODE PHASE COMPLETE ***")
+    print(f"Review agents/output/{safe_filename}")
+    print("Copy the Python code into the actual game file when you are happy with it.")
+
+    return code_output
+
+
+def run_phase_review(target_file: str = None) -> str:
+    """Run the QA Review phase: Reviewer checks the most recent code output.
+
+    The reviewer reads a code output file and produces a full QA report,
+    including a kid-readability score and git commit commands.
+
+    Args:
+        target_file: Optional. The game file to review, e.g. "game/player.py".
+                     If not given, the most recently modified code output is used.
+
+    Returns:
+        The reviewer's report as a string.
+    """
+    print("\n*** PHASE: QA REVIEW ***")
+
+    # Figure out which code file to review
+    if target_file:
+        safe_filename = target_file.replace("/", "_").replace("\\", "_") + ".md"
+        code_output_path = OUTPUT_DIR / safe_filename
+        if not code_output_path.exists():
+            print(f"ERROR: No output file found for '{target_file}'.")
+            print(f"Expected: {code_output_path}")
+            print("Run --phase code first to generate the code.")
+            sys.exit(1)
+    else:
+        # Find the most recently modified code output file
+        code_files = [
+            f for f in OUTPUT_DIR.glob("*.md")
+            if f.name not in ("story_design.md", "art_guide.md", "code_review.md", "sound_design.md")
+        ]
+        if not code_files:
+            print("ERROR: No code output files found in agents/output/")
+            print("Run --phase code first to generate some code to review.")
+            sys.exit(1)
+        code_output_path = max(code_files, key=lambda f: f.stat().st_mtime)
+        print(f"  Reviewing most recent code output: {code_output_path.name}")
+
+    code_content = code_output_path.read_text(encoding="utf-8")
+    claude_md = load_context_file("CLAUDE.md")
+
+    qa_prompt = load_system_prompt("qa_reviewer")
+    user_message = (
+        f"## CLAUDE.md — Project Instructions\n\n{claude_md}\n\n"
+        f"## File to Review: {code_output_path.name}\n\n"
+        f"{code_content}\n\n"
+        f"## Your Task\n\n"
+        f"Review the code above. Produce a full QA report following your instructions."
+    )
+
+    review_output = call_agent(
+        "QA Reviewer",
+        qa_prompt,
+        user_message,
+        max_tokens=MAX_TOKENS_REVIEW
+    )
+    save_output("QA Reviewer", review_output, "code_review.md")
+
+    print("\n*** QA REVIEW PHASE COMPLETE ***")
+    print("Review agents/output/code_review.md for the full report.")
+    print("Run the git commands from the report when you are ready to commit.")
+
+    return review_output
+
+
+def run_phase_sound(task: str) -> str:
+    """Run the Sound Designer agent to create a full sound design plan.
+
+    The Sound Designer reads the story/lore context and produces a
+    detailed plan listing every music track and sound effect the game
+    needs — with filenames, style notes, and trigger conditions.
+    Output saved to agents/output/sound_design.md for dad to review.
+
+    Args:
+        task: Additional instructions to pass to the Sound Designer.
+
+    Returns:
+        The sound designer's output as a string.
+    """
+    print("\n*** PHASE: SOUND ***")
+    print("Running Sound Designer agent.\n")
+
+    # Load the sound designer's system prompt
+    sound_prompt_path = PROMPTS_DIR / "sound_designer.md"
+    if not sound_prompt_path.exists():
+        print(f"ERROR: Sound designer prompt not found at {sound_prompt_path}")
+        print("Please create agents/prompts/sound_designer.md first.")
+        sys.exit(1)
+    sound_system_prompt = sound_prompt_path.read_text(encoding="utf-8")
+
+    # Load shared project context
+    claude_md = load_context_file("CLAUDE.md")
+
+    # Load story context — prefer the approved docs/ version, fall back to agents/output/
+    story_doc = load_design_doc("story_design.md")
+
+    user_message = (
+        f"## CLAUDE.md — Project Instructions\n\n{claude_md}\n\n"
+        f"## Story & Design Document\n\n{story_doc}\n\n"
+        f"## Your Task\n\n{task}\n\n"
+        f"Please create the full Sound Design Plan for this game as described in your instructions."
+    )
+
+    sound_output = call_agent(
+        "Sound Designer",
+        sound_system_prompt,
+        user_message,
+        max_tokens=MAX_TOKENS_SOUND
+    )
+    save_output("Sound Designer", sound_output, "sound_design.md")
+
+    print("\n*** SOUND PHASE COMPLETE ***")
+    print("Review agents/output/sound_design.md for the full sound plan.")
+    print("Copy to docs/ when you are happy with it.")
+
+    return sound_output
+
+
+def run_all_phases(task: str, first_code_file: str) -> None:
+    """Run all phases in sequence: Design → Code → Review.
+
+    This is the 'quick start' option. It runs the full pipeline to
+    produce the design documents, write one starting code file, and
+    review it all in one go.
+
+    Args:
+        task:            The overall goal to pass to each agent.
+        first_code_file: The first game file for the Programmer to write.
+    """
+    print("\n*** RUNNING ALL PHASES ***\n")
+
+    run_phase_design(task)
+    run_phase_code(f"Write the foundation file for the game.", first_code_file)
+    run_phase_review(first_code_file)
+
+    print("\n*** ALL PHASES COMPLETE ***")
+    print("Check agents/output/ for all generated files.")
+    print("Review each file and copy approved content to docs/ or game/")
+
+
+# ---------------------------------------------------------------------------
+# Main entry point — reads command line arguments and runs the right phase
+# ---------------------------------------------------------------------------
+
+def main():
+    """Parse command line arguments and run the chosen agent phase."""
+
+    parser = argparse.ArgumentParser(
+        description="Run AI agents to help build The Ancient Wizard's Star",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python agents/orchestrator.py --phase design
+  python agents/orchestrator.py --phase code --file game/player.py
+  python agents/orchestrator.py --phase review --file game/player.py
+  python agents/orchestrator.py --phase sound
+  python agents/orchestrator.py --phase all
+        """
+    )
+
+    parser.add_argument(
+        "--phase",
+        choices=["design", "code", "review", "sound", "all"],
+        required=True,
+        help="Which phase to run: design, code, review, sound, or all"
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="",
+        help="Additional instructions to pass to the agent(s)"
+    )
+    parser.add_argument(
+        "--file",
+        type=str,
+        default="main.py",
+        help="Which game file the Programmer should write (used with --phase code or review)"
+    )
+
+    args = parser.parse_args()
+
+    # Check that the API key is available before doing anything
+    # The key should be in a .env file in the project root, or set as an environment variable
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        # Try loading from a .env file
+        env_file = PROJECT_ROOT / ".env"
+        if env_file.exists():
+            # Load the .env file manually (simple version — works for ANTHROPIC_API_KEY=value)
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ[key.strip()] = value.strip()
+
+    # Check again after trying to load .env
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("\nERROR: ANTHROPIC_API_KEY is not set!")
+        print("Please create a .env file in the project root with:")
+        print("  ANTHROPIC_API_KEY=sk-ant-...")
+        print("\nOr set it as an environment variable:")
+        print("  export ANTHROPIC_API_KEY=sk-ant-...")
+        sys.exit(1)
+
+    print("\n=== The Ancient Wizard's Star — Agent Orchestrator ===")
+    print(f"Phase: {args.phase}")
+    if args.task:
+        print(f"Task:  {args.task}")
+    if args.phase in ("code", "review"):
+        print(f"File:  {args.file}")
+
+    # Run the chosen phase
+    if args.phase == "design":
+        task = args.task or "Create the full story, world design, and art guide for the game."
+        run_phase_design(task)
+
+    elif args.phase == "code":
+        task = args.task or f"Write a complete, well-commented implementation of {args.file}."
+        run_phase_code(task, args.file)
+
+    elif args.phase == "review":
+        run_phase_review(args.file if args.file != "main.py" else None)
+
+    elif args.phase == "sound":
+        task = args.task or "Create the full Sound Design Plan for the game."
+        run_phase_sound(task)
+
+    elif args.phase == "all":
+        task = args.task or "Build the complete game foundation with story, art guide, and starter code."
+        run_all_phases(task, args.file)
+
+
+if __name__ == "__main__":
+    main()

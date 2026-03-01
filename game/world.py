@@ -28,6 +28,8 @@ TILE_DIRT  = 1
 TILE_WALL  = 2
 TILE_TREE  = 3
 TILE_WATER = 4
+TILE_STONE    = 5   # dark stone floor for the arena interior
+TILE_ELECTRIC = 6   # animated danger pit in the corners
 
 # Where the portal gate is drawn (in pixels from the top-left corner)
 PORTAL_X = 1050
@@ -411,3 +413,133 @@ class World:
                     wall_rects.append(rect)
 
         return wall_rects
+
+
+class VoltrakArena:
+    """A special battle arena used for the final Voltrak boss fight.
+
+    This class uses the same interface as World:
+      - update() advances animated tiles
+      - draw(screen) paints the tile grid
+    """
+
+    def __init__(self):
+        # Build a 40x22 grid:
+        # - perimeter = walls
+        # - interior = stone floor
+        # - four inner corners = electric danger pits
+        self.grid = []
+        for row_index in range(MAP_ROWS):
+            row = []
+            for col_index in range(MAP_COLS):
+                is_perimeter = (
+                    row_index == 0 or row_index == MAP_ROWS - 1
+                    or col_index == 0 or col_index == MAP_COLS - 1
+                )
+                if is_perimeter:
+                    row.append(TILE_WALL)
+                else:
+                    row.append(TILE_STONE)
+            self.grid.append(row)
+
+        # Electric pit corner zones:
+        # rows 1-3 and 18-20, cols 1-3 and 37-39
+        corner_rows_top = range(1, 4)
+        corner_rows_bottom = range(18, 21)
+        corner_cols_left = range(1, 4)
+        corner_cols_right = range(37, 40)
+
+        for row_index in corner_rows_top:
+            for col_index in corner_cols_left:
+                self.grid[row_index][col_index] = TILE_ELECTRIC
+            for col_index in corner_cols_right:
+                self.grid[row_index][col_index] = TILE_ELECTRIC
+
+        for row_index in corner_rows_bottom:
+            for col_index in corner_cols_left:
+                self.grid[row_index][col_index] = TILE_ELECTRIC
+            for col_index in corner_cols_right:
+                self.grid[row_index][col_index] = TILE_ELECTRIC
+
+        # Static tiles used by the arena.
+        self.tile_images = {
+            TILE_WALL: self._load_static_tile("tile_wall.png", FALLBACK_COLORS[TILE_WALL]),
+            TILE_STONE: self._load_static_tile("tile_stone.png", (85, 80, 96)),
+        }
+
+        # Electric pit animation frames.
+        self.electric_frames = self._load_animated_sheet(
+            filename="tile_electric.png",
+            frame_width=TILE_SIZE,
+            frame_height=TILE_SIZE,
+            frame_count=4,
+        )
+
+        self.frame_tick = 0
+        self.electric_frame_index = 0
+
+    def _load_static_tile(self, filename: str, fallback_color: tuple) -> pygame.Surface:
+        """Load one tile image, or use a colored placeholder if missing."""
+        tile_path = ASSET_ROOT / filename
+        try:
+            if not tile_path.exists():
+                raise FileNotFoundError(f"Missing tile: {tile_path}")
+            image = pygame.image.load(str(tile_path)).convert_alpha()
+            if image.get_size() != (TILE_SIZE, TILE_SIZE):
+                image = pygame.transform.scale(image, (TILE_SIZE, TILE_SIZE))
+            return image
+        except Exception:
+            surface = pygame.Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
+            surface.fill(fallback_color)
+            pygame.draw.rect(surface, OUTLINE_COLOR, surface.get_rect(), width=2)
+            return surface
+
+    def _load_animated_sheet(self, filename: str, frame_width: int, frame_height: int, frame_count: int) -> list:
+        """Load and slice a horizontal animation strip, with safe fallback."""
+        sheet_path = ASSET_ROOT / filename
+        try:
+            if not sheet_path.exists():
+                raise FileNotFoundError(f"Missing sheet: {sheet_path}")
+            sheet = pygame.image.load(str(sheet_path)).convert_alpha()
+            frames = []
+            for index in range(frame_count):
+                frame = pygame.Surface((frame_width, frame_height), pygame.SRCALPHA)
+                source_rect = pygame.Rect(index * frame_width, 0, frame_width, frame_height)
+                frame.blit(sheet, (0, 0), area=source_rect)
+                frames.append(frame.convert_alpha())
+            return frames
+        except Exception:
+            frames = []
+            for _ in range(frame_count):
+                frame = pygame.Surface((frame_width, frame_height), pygame.SRCALPHA)
+                frame.fill((255, 176, 0, 160))
+                pygame.draw.rect(frame, OUTLINE_COLOR, frame.get_rect(), width=2)
+                frames.append(frame)
+            return frames
+
+    def update(self):
+        """Advance electric pit animation every 8 game ticks."""
+        self.frame_tick += 1
+        if self.frame_tick >= 8:
+            self.frame_tick = 0
+            self.electric_frame_index = (self.electric_frame_index + 1) % len(self.electric_frames)
+
+    def draw(self, screen: pygame.Surface):
+        """Draw the full arena tile grid."""
+        electric_frame = self.electric_frames[self.electric_frame_index]
+
+        for row_index in range(MAP_ROWS):
+            for col_index in range(MAP_COLS):
+                pixel_x = col_index * TILE_SIZE
+                pixel_y = row_index * TILE_SIZE
+                tile_type = self.grid[row_index][col_index]
+
+                if tile_type == TILE_ELECTRIC:
+                    screen.blit(electric_frame, (pixel_x, pixel_y))
+                else:
+                    tile_image = self.tile_images.get(tile_type)
+                    if tile_image is not None:
+                        screen.blit(tile_image, (pixel_x, pixel_y))
+                    else:
+                        pygame.draw.rect(screen, (255, 0, 0),
+                                         pygame.Rect(pixel_x, pixel_y, TILE_SIZE, TILE_SIZE))

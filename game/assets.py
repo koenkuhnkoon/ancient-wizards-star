@@ -10,7 +10,7 @@ from game.asset_manifest import PLAYER_SPRITES
 
 
 ASSET_ROOT = Path("assets")
-PLAYER_DIR = ASSET_ROOT / "sprites" / "players"
+PLAYER_DIR = ASSET_ROOT   # All sprite sheets live directly in assets/
 OUTLINE_COLOR = (26, 26, 26)
 
 
@@ -50,45 +50,48 @@ def _placeholder_frames(character_class: str, width: int, height: int, frame_cou
 
 
 def load_player_animations(character_class: str) -> dict[str, list[pygame.Surface]]:
-    """Load player animations from disk or generate placeholder frames."""
-    spec = PLAYER_SPRITES[character_class]
-    animations = {
-        "idle": spec.idle_frames,
-        "walk": spec.walk_frames,
-        "attack": spec.attack_frames,
-    }
+    """Load player animations from disk or generate placeholder frames.
 
-    loaded: dict[str, list[pygame.Surface]] = {}
-    for animation_name, expected_frames in animations.items():
+    If idle/walk sheets are missing but the attack sheet loaded, we reuse the
+    first attack frame so the character always looks like their illustrated self,
+    not a coloured square.
+    """
+    spec = PLAYER_SPRITES[character_class]
+
+    def _try_load(animation_name: str, expected_frames: int) -> list[pygame.Surface] | None:
+        """Try to load one sprite sheet. Returns sliced frames or None on failure."""
         path = _sheet_path(spec.prefix, animation_name)
         if not path.exists():
-            loaded[animation_name] = _placeholder_frames(
-                character_class,
-                spec.frame_width,
-                spec.frame_height,
-                expected_frames,
-            )
-            continue
-
+            return None
         try:
             sheet = pygame.image.load(str(path)).convert_alpha()
             expected_size = (spec.frame_width * expected_frames, spec.frame_height)
             if sheet.get_size() != expected_size:
-                raise ValueError(f"{path} has size {sheet.get_size()}, expected {expected_size}")
-            loaded[animation_name] = _slice_sheet(
-                sheet,
-                spec.frame_width,
-                spec.frame_height,
-                expected_frames,
-            )
+                return None
+            return _slice_sheet(sheet, spec.frame_width, spec.frame_height, expected_frames)
         except Exception:
-            loaded[animation_name] = _placeholder_frames(
-                character_class,
-                spec.frame_width,
-                spec.frame_height,
-                expected_frames,
-            )
+            return None
 
+    attack_frames = _try_load("attack", spec.attack_frames)
+    idle_frames   = _try_load("idle",   spec.idle_frames)
+    walk_frames   = _try_load("walk",   spec.walk_frames)
+
+    # If idle/walk sheets don't exist yet, repeat the first attack frame so the
+    # character looks like their illustrated self instead of a coloured square.
+    if attack_frames:
+        if not idle_frames:
+            idle_frames = [attack_frames[0]] * spec.idle_frames
+        if not walk_frames:
+            walk_frames = [attack_frames[0]] * spec.walk_frames
+
+    def _placeholder(n: int) -> list[pygame.Surface]:
+        return _placeholder_frames(character_class, spec.frame_width, spec.frame_height, n)
+
+    loaded = {
+        "attack": attack_frames or _placeholder(spec.attack_frames),
+        "idle":   idle_frames   or _placeholder(spec.idle_frames),
+        "walk":   walk_frames   or _placeholder(spec.walk_frames),
+    }
     loaded["run"] = loaded["walk"]
     return loaded
 

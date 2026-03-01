@@ -22,9 +22,21 @@ import pygame
 # ------------------------------------------------------------
 
 CHASE_RANGE = 200        # Pixels — enemy starts chasing when the player is closer than this
-ATTACK_RANGE = 40        # Pixels — enemy deals damage when this close to the player
-ENEMY_ATTACK_DAMAGE = 1  # How much health the player loses from one enemy hit
+ATTACK_RANGE = 40        # Pixels — regular enemy deals damage when this close to the player
+ENEMY_ATTACK_DAMAGE = 1  # How much health the player loses from one regular enemy hit
 ATTACK_COOLDOWN = 90     # Frames between enemy attacks (90 frames = 1.5 seconds at 60 FPS)
+
+# Mini-bosses are bigger sprites, so they need a wider attack range.
+# They also hit harder — fighting a boss should feel dangerous!
+BOSS_ATTACK_DAMAGE = 3   # 3× a regular enemy — bosses are no joke!
+BOSS_ATTACK_RANGE  = 60  # Wider reach (Grimrak is 80 px wide, Zara is 64 px wide)
+
+# Animation timing for enemy sprite sheets.
+# These numbers control how quickly frames advance in each state.
+ENEMY_ANIM_IDLE_SPEED   = 14   # frames between animation frame advances while wandering
+ENEMY_ANIM_WALK_SPEED   =  8   # frames between advances while chasing
+ENEMY_ANIM_ATTACK_SPEED =  5   # frames between advances during attack animation
+ENEMY_ATTACK_ANIM_TICKS = 12   # how many frames to hold the attack animation
 WANDER_CHANGE_TICKS = 150  # How often (in frames) an enemy picks a new wander direction
 RESPAWN_TICKS = 600      # Frames before a dead enemy respawns at its start point (10 seconds)
 
@@ -32,6 +44,10 @@ RESPAWN_TICKS = 600      # Frames before a dead enemy respawns at its start poin
 # 0.60 = 60% chance. random.random() gives a number between 0.0 and 1.0,
 # so "< SHARD_DROP_CHANCE" is True 60% of the time.
 SHARD_DROP_CHANCE = 0.60
+
+# Chance that a defeated enemy drops a small health potion.
+# 0.25 = 25% chance — less common than shards (60%)
+HEALTH_POTION_DROP_CHANCE = 0.25
 
 # Enemy states — tracks what the enemy is doing right now
 STATE_WANDER = "wander"  # Slowly walking around
@@ -76,6 +92,42 @@ def _load_sprite(filename, width, height, fallback_color):
         return surface
 
 
+def _load_enemy_animations(base_name, w, h, fallback_sprite):
+    """Try to load walk and attack sprite sheets for an enemy.
+
+    Looks for:
+      assets/BASE_walk.png   — horizontal strip, 4 frames of w×h px
+      assets/BASE_attack.png — horizontal strip, 4 frames of w×h px
+
+    If either file is missing, falls back to a 1-frame list containing
+    the existing fallback_sprite so the game still works without art.
+
+    Returns: {"idle": [sprite], "walk": [...], "attack": [...]}
+    """
+    animations = {
+        "idle": [fallback_sprite],
+        "walk": [fallback_sprite],
+        "attack": [fallback_sprite],
+    }
+
+    def _load_sheet_frames(filename):
+        path = ASSET_ROOT / filename
+        try:
+            sheet = pygame.image.load(str(path)).convert_alpha()
+            frames = []
+            for i in range(4):
+                frame_rect = pygame.Rect(i * w, 0, w, h)
+                frame = sheet.subsurface(frame_rect).copy()
+                frames.append(frame)
+            return frames
+        except Exception:
+            return [fallback_sprite]
+
+    animations["walk"] = _load_sheet_frames(f"{base_name}_walk.png")
+    animations["attack"] = _load_sheet_frames(f"{base_name}_attack.png")
+    return animations
+
+
 # ------------------------------------------------------------
 # ENEMY BASE CLASS — the blueprint every enemy type uses
 # ------------------------------------------------------------
@@ -114,6 +166,7 @@ class Enemy:
         # Health stats
         self.health = health
         self.max_health = health  # Save the full health so we can restore it on respawn
+                                  # Also used by the Assassin's special damage formula!
 
         # Movement
         self.speed = speed        # How fast the enemy moves when chasing the player
@@ -123,8 +176,26 @@ class Enemy:
         self.sprite_height = sprite_height
         self.sprite = sprite      # A single pygame.Surface (one image, no animation yet)
 
+        # Animation state machine:
+        # idle   = wandering
+        # walk   = chasing
+        # attack = playing the attack swing/strike animation
+        self.animations        = {}      # filled by subclass; empty = use static self.sprite
+        self.anim_state        = "idle"  # "idle", "walk", or "attack"
+        self.anim_frame        = 0       # current frame index into animations[anim_state]
+        self.anim_tick         = 0       # counts up; advance frame when it hits the speed threshold
+        self.attack_anim_ticks = 0       # counts down after an attack so we hold the attack pose
+
         # State machine — what is this enemy doing right now?
         self.state = STATE_WANDER
+
+        # Attack stats — stored on the instance so subclasses (MiniBoss) can override them
+        self.attack_damage = ENEMY_ATTACK_DAMAGE  # HP the player loses per hit
+        self.attack_range  = ATTACK_RANGE         # Distance in pixels to start attacking
+
+        # Signal flag: True for exactly ONE frame when this enemy lands a hit on the player.
+        # main.py reads this to play a sound and show a red flash at the player's position.
+        self.just_attacked = False
 
         # Attack cooldown — prevents the enemy from dealing damage every single frame
         self.attack_cooldown_ticks = 0
@@ -142,6 +213,15 @@ class Enemy:
         # Signal flag: True for exactly one frame when this enemy dies.
         # main.py reads this flag to know it should spawn a magical shard at our position!
         self.just_died = False
+
+        # Potion drop flag: True for exactly one frame when a defeated enemy drops a potion.
+        # main.py reads this to know it should spawn a small health potion at our position!
+        self.potion_drop = False
+
+        # Hit-this-swing flag: prevents the same enemy from being hit more than once
+        # during a single melee swing. main.py sets this to True when it hits us,
+        # and we reset it to False at the start of every update() frame.
+        self._already_hit_this_swing = False
 
     # ----------------------------------------------------------
     # HELPER METHODS
@@ -185,11 +265,18 @@ class Enemy:
             player -- the Player object (so we can measure distance and deal damage)
         """
 
-        # Reset the just_died flag every frame — it should only be True for ONE frame.
-        # WHY here at the very top? Because if we put it after the STATE_DEAD check,
-        # the early return would skip it, and just_died would stay True for all 600
-        # frames of the respawn period — spawning 600 shards instead of 1!
-        self.just_died = False
+        # Reset the one-frame signal flags at the very top of update().
+        # WHY here? Because if we put it after the STATE_DEAD check, the early
+        # return would skip it, and just_died would stay True for all 600 frames
+        # of the respawn period — spawning 600 shards instead of 1!
+        self.just_died     = False
+        self.potion_drop   = False
+        self.just_attacked = False   # Reset before we decide whether to attack this frame
+
+        # Reset the swing flag each frame so we can be hit again next frame.
+        # This stops an attack zone from hitting us 60 times per second, but
+        # does allow us to be hit again on the player's NEXT swing.
+        self._already_hit_this_swing = False
 
         # --- Dead state: count down to respawn, then come back to life ---
         if self.state == STATE_DEAD:
@@ -216,15 +303,60 @@ class Enemy:
         elif self.state == STATE_CHASE:
             self._move_toward_player(player)
 
+        # If we are not currently holding an attack animation, match animation to movement state.
+        if self.attack_anim_ticks <= 0:
+            if self.state == STATE_WANDER:
+                self._set_anim_state("idle")
+            elif self.state == STATE_CHASE:
+                self._set_anim_state("walk")
+
         # --- Attack the player if they're very close (and cooldown allows it) ---
-        if dist < ATTACK_RANGE and self.attack_cooldown_ticks <= 0:
-            player.take_damage(ENEMY_ATTACK_DAMAGE)
+        if dist < self.attack_range and self.attack_cooldown_ticks <= 0:
+            player.take_damage(self.attack_damage)
+            self.just_attacked = True            # Signal main.py: show a red flash + play sound!
             # Start the cooldown timer so we can't hit again immediately
             self.attack_cooldown_ticks = ATTACK_COOLDOWN
+            # Start the attack animation and hold it briefly.
+            self._set_anim_state("attack")
+            self.attack_anim_ticks = ENEMY_ATTACK_ANIM_TICKS
+
+        # Count down attack animation hold timer.
+        if self.attack_anim_ticks > 0:
+            self.attack_anim_ticks -= 1
+            if self.attack_anim_ticks <= 0:
+                if self.state == STATE_CHASE:
+                    self._set_anim_state("walk")
+                else:
+                    self._set_anim_state("idle")
 
         # Count down the attack cooldown each frame
         if self.attack_cooldown_ticks > 0:
             self.attack_cooldown_ticks -= 1
+
+        # Step the animation forward at the speed for the current state.
+        self._advance_animation()
+
+    def _set_anim_state(self, new_state):
+        """Switch animation state and safely reset frame counters when state changes."""
+        if self.anim_state != new_state:
+            self.anim_state = new_state
+            self.anim_frame = 0
+            self.anim_tick = 0
+
+    def _advance_animation(self):
+        """Step the animation forward by one frame if enough ticks have passed."""
+        speed_map = {
+            "idle":   ENEMY_ANIM_IDLE_SPEED,
+            "walk":   ENEMY_ANIM_WALK_SPEED,
+            "attack": ENEMY_ANIM_ATTACK_SPEED,
+        }
+        speed = speed_map.get(self.anim_state, ENEMY_ANIM_WALK_SPEED)
+        self.anim_tick += 1
+        if self.anim_tick >= speed:
+            self.anim_tick = 0
+            frames = self.animations.get(self.anim_state, [])
+            if frames:
+                self.anim_frame = (self.anim_frame + 1) % len(frames)
 
     # ----------------------------------------------------------
     # MOVEMENT METHODS
@@ -300,17 +432,20 @@ class Enemy:
             self._die()
 
     def _die(self):
-        """The enemy has been defeated! Switch to the dead state and maybe signal a shard drop.
+        """The enemy has been defeated! Switch to the dead state and maybe signal drops.
 
         There's a 60% chance (SHARD_DROP_CHANCE) that a defeated enemy drops a shard.
+        There's also a 25% chance (HEALTH_POTION_DROP_CHANCE) of a small health potion drop.
         just_died = True signals main.py to create a shard at this position.
-        just_died = False means no shard this time — the enemy was defeated but dropped nothing.
+        potion_drop = True signals main.py to create a small health potion here.
         """
         self.state = STATE_DEAD
         self.respawn_ticks = 0
         # random.random() gives a random number between 0.0 and 1.0 each time.
         # If it's less than 0.60, we drop a shard — so 60% of the time we do!
         self.just_died = random.random() < SHARD_DROP_CHANCE
+        # 25% chance to also drop a small health potion — nice bonus for the player!
+        self.potion_drop = random.random() < HEALTH_POTION_DROP_CHANCE
 
     def _respawn(self):
         """Bring the enemy back to life at its original starting position.
@@ -343,8 +478,11 @@ class Enemy:
         if self.state == STATE_DEAD:
             return  # Nothing to draw while dead
 
-        # Draw the enemy sprite at its current position
-        screen.blit(self.sprite, (self.x, self.y))
+        # Pick the correct animation frame for the current state.
+        # If no animations are loaded, fall back to the static sprite.
+        frames = self.animations.get(self.anim_state, [])
+        frame  = frames[self.anim_frame] if frames else self.sprite
+        screen.blit(frame, (self.x, self.y))
 
         # --- Health bar ---
         # Draw a small horizontal bar 8 pixels above the enemy's top edge.
@@ -393,6 +531,7 @@ class EvilNinja(Enemy):
             sprite_height=44,
             sprite=sprite,
         )
+        self.animations = _load_enemy_animations("enemy_evil_ninja", 44, 44, sprite)
 
 
 class Skeleton(Enemy):
@@ -417,6 +556,7 @@ class Skeleton(Enemy):
             sprite_height=48,
             sprite=sprite,
         )
+        self.animations = _load_enemy_animations("enemy_skeleton", 44, 48, sprite)
 
 
 class Zombie(Enemy):
@@ -442,6 +582,47 @@ class Zombie(Enemy):
             sprite_height=48,
             sprite=sprite,
         )
+        self.animations = _load_enemy_animations("enemy_zombie", 44, 48, sprite)
+
+
+class EnemyProjectile:
+    """A projectile fired by an enemy toward the player.
+
+    Travels in a straight line until it hits the player or goes too far.
+    Drawn as a filled circle (no sprite required — keeps it simple!).
+    """
+
+    def __init__(self, x, y, target_x, target_y, speed, damage, color, max_travel=500):
+        self.x          = x
+        self.y          = y
+        self.damage     = damage
+        self.color      = color      # (R, G, B)
+        self.radius     = 8
+        self.alive      = True
+        self.traveled   = 0
+        self.max_travel = max_travel
+
+        # Unit vector pointing from the firing position toward the target
+        dx   = target_x - x
+        dy   = target_y - y
+        dist = math.sqrt(dx * dx + dy * dy) or 1
+        self.dx = dx / dist * speed
+        self.dy = dy / dist * speed
+
+    def update(self):
+        self.x        += self.dx
+        self.y        += self.dy
+        self.traveled += math.sqrt(self.dx ** 2 + self.dy ** 2)
+        if self.traveled >= self.max_travel:
+            self.alive = False
+
+    def get_rect(self):
+        return pygame.Rect(int(self.x) - self.radius, int(self.y) - self.radius,
+                           self.radius * 2, self.radius * 2)
+
+    def draw(self, screen):
+        if self.alive:
+            pygame.draw.circle(screen, self.color, (int(self.x), int(self.y)), self.radius)
 
 
 # ------------------------------------------------------------
@@ -458,12 +639,42 @@ class MiniBoss(Enemy):
     """
 
     def __init__(self, spawn_x, spawn_y, health, speed, sprite_width, sprite_height, sprite):
-        """Set up a mini-boss — same as a regular enemy, but permanent."""
+        """Set up a mini-boss — same as a regular enemy, but bigger, tougher, and permanent."""
         super().__init__(spawn_x, spawn_y, health, speed, sprite_width, sprite_height, sprite)
+
+        # Bosses hit much harder and have a wider reach than regular enemies!
+        # We override the instance variables set in Enemy.__init__ so the base attack
+        # logic in Enemy.update() automatically uses these stronger values.
+        self.attack_damage = BOSS_ATTACK_DAMAGE   # 3 HP per hit (vs 1 for regular enemies)
+        self.attack_range  = BOSS_ATTACK_RANGE    # 60 px reach (vs 40 — big sprites need more)
+
+        # Boss-specific potion drop flag: True for one frame when a mini-boss is defeated.
+        # Mini-bosses drop a BIG golden potion — a full heal for the player!
+        self.boss_potion_drop = False
+
+    def update(self, player):
+        """Update the mini-boss each frame — same as a regular enemy, but also resets boss_potion_drop."""
+        # Reset the boss potion drop flag each frame, same as just_died and potion_drop.
+        # It should only be True for the one frame when the boss dies!
+        self.boss_potion_drop = False
+        # Let the parent Enemy class handle all the regular update logic
+        super().update(player)
 
     def _respawn(self):
         """Mini-bosses NEVER come back after being defeated — this does nothing on purpose!"""
         pass   # Override the parent's respawn so they stay dead forever
+
+    def _die(self):
+        """Mini-bosses always drop a BIG health potion when defeated — you earned it!
+
+        They also drop a shard and they never respawn. Beating a mini-boss
+        is a huge moment, so we make sure the reward feels great!
+        """
+        self.state = STATE_DEAD
+        self.respawn_ticks = 0
+        self.just_died = True           # Always drop a shard too
+        self.boss_potion_drop = True    # The big reward: a full-heal potion!
+        self.potion_drop = False        # Skip the small potion (they get the big one)
 
     def is_permanently_dead(self):
         """Return True if this mini-boss has been beaten and won't come back."""
@@ -476,13 +687,13 @@ class Grimrak(MiniBoss):
     He's big, slow, and very tough. You'll need many hits to defeat him.
     Spawns when you collect 25 magical shards!
 
-    Sprite file: assets/enemy_grimrak.png — 80 x 80 px
+    Sprite file: assets/boss_grimrak.png — 80 x 80 px
     Fallback color: dark grey (like a stone golem!)
     """
 
     def __init__(self, spawn_x, spawn_y):
         """Create Grimrak at the given position."""
-        sprite = _load_sprite("enemy_grimrak.png", 80, 80, (80, 80, 80))
+        sprite = _load_sprite("boss_grimrak.png", 80, 80, (80, 80, 80))
         super().__init__(
             spawn_x, spawn_y,
             health=20,          # Very tough — needs LOTS of hits!
@@ -491,6 +702,28 @@ class Grimrak(MiniBoss):
             sprite_height=80,
             sprite=sprite,
         )
+        self.animations = _load_enemy_animations("boss_grimrak", 80, 80, sprite)
+
+        # Ground slam special attack:
+        # cooldown counts down while chasing, then we activate a short slam window.
+        self.slam_cooldown = 300   # 5 seconds at 60 FPS; counts down to 0 then slams
+        self.slam_active   = 0     # counts down from 20 when a slam is happening (0.33 s)
+
+    def update(self, player):
+        """Update Grimrak and run his ground-slam timer logic."""
+        super().update(player)
+
+        if self.state == STATE_DEAD:
+            return
+
+        if self.state == STATE_CHASE:
+            self.slam_cooldown -= 1
+            if self.slam_cooldown <= 0:
+                self.slam_cooldown = 300
+                self.slam_active   = 20
+
+        if self.slam_active > 0:
+            self.slam_active -= 1
 
 
 class Zara(MiniBoss):
@@ -500,13 +733,13 @@ class Zara(MiniBoss):
     sides when defeated and joins your team — but that feature is coming later!
     Spawns when you collect 50 magical shards total!
 
-    Sprite file: assets/enemy_zara.png — 64 x 64 px
+    Sprite file: assets/boss_zara.png — 64 x 64 px
     Fallback color: electric purple (she controls lightning!)
     """
 
     def __init__(self, spawn_x, spawn_y):
         """Create Zara at the given position."""
-        sprite = _load_sprite("enemy_zara.png", 64, 64, (130, 0, 200))
+        sprite = _load_sprite("boss_zara.png", 64, 64, (130, 0, 200))
         super().__init__(
             spawn_x, spawn_y,
             health=15,          # Tough, but not as tough as Grimrak
@@ -515,6 +748,171 @@ class Zara(MiniBoss):
             sprite_height=64,
             sprite=sprite,
         )
+        self.animations = _load_enemy_animations("boss_zara", 64, 64, sprite)
+
+        # Zara's ranged magic bolt ability.
+        self.bolt_cooldown       = 180   # 3 seconds; counts down to 0 then fires
+        self.pending_projectiles = []    # handed off to main.py each frame
+
+    def update(self, player):
+        """Update Zara and fire a purple bolt every few seconds while chasing."""
+        super().update(player)
+
+        self.pending_projectiles = []   # reset each frame
+        if self.state == STATE_DEAD:
+            return
+
+        if self.state == STATE_CHASE:
+            self.bolt_cooldown -= 1
+            if self.bolt_cooldown <= 0:
+                self.bolt_cooldown = 180
+                cx, cy = self.get_center()
+                px, py = player.x + 24, player.y + 24
+                self.pending_projectiles.append(
+                    EnemyProjectile(cx, cy, px, py,
+                                    speed=6, damage=2, color=(180, 0, 255))
+                )
+
+
+# ------------------------------------------------------------
+# FINAL BOSS — Voltrak the Shockblade Eel!
+# ------------------------------------------------------------
+
+class Voltrak(MiniBoss):
+    """Voltrak the Shockblade Eel — the FINAL BOSS of The Ancient Wizard's Star!
+
+    He is a ninja-style land-eel who fights with an electric sword.
+    He chases the player and fires electric shock bolts in all 4 directions.
+
+    Two phases:
+    - Phase 1 (full health to 50%): speed 2, shocks every 2 seconds
+    - Phase 2 (below 50% health):   speed 3, shocks every 1.17 seconds — DANGER!
+
+    Beat Grimrak and Zara first, collect the Portal Key, and step through
+    the portal gate to start this boss fight!
+
+    Sprite: assets/boss_ninja_land_eel.png (128 x 64 px)
+    Fallback color: dark teal — like a deep-water eel
+    """
+
+    # How many frames pass between electric shock volleys
+    SHOCK_INTERVAL_PHASE1 = 120   # 2.0 seconds (60 FPS) in Phase 1
+    SHOCK_INTERVAL_PHASE2 = 70    # 1.17 seconds in Phase 2 — MUCH more dangerous!
+
+    # Electric shock bolt dimensions
+    SHOCK_RANGE     = 200   # Pixels the bolt travels from Voltrak's centre
+    SHOCK_THICKNESS = 20    # Narrow side of each bolt rectangle
+
+    # How long each shock zone stays on screen (pure visual — damage is checked at fire time)
+    SHOCK_DURATION = 18     # 0.3 seconds
+
+    SHOCK_DAMAGE    = 2     # HP lost if the player is standing in a shock zone when it fires
+    PHASE2_THRESHOLD = 0.5  # Switch to Phase 2 when health falls below 50%
+
+    def __init__(self, spawn_x, spawn_y):
+        """Create Voltrak at the given position."""
+        sprite = _load_sprite("boss_ninja_land_eel.png", 128, 64, (20, 100, 80))
+        super().__init__(
+            spawn_x, spawn_y,
+            health=40,          # Very tough — needs a LOT of hits!
+            speed=2,            # Fast, like Zara
+            sprite_width=128,
+            sprite_height=64,
+            sprite=sprite,
+        )
+        self.shock_timer      = 90    # First shock fires after 1.5 seconds — gives the player a moment to react
+        self.shock_zones      = []    # List of [rect, timer_remaining] — the visible electric bolts
+        self.shock_just_fired = False # True for exactly ONE frame when shocks fire; main.py checks this!
+
+    def update(self, player):
+        """Update Voltrak each frame: move, chase, attack, and fire electric shocks."""
+
+        # Reset the one-frame shock signal at the very start
+        self.shock_just_fired = False
+
+        # Call MiniBoss → Enemy update: handles wandering, chasing, melee contact, and dying
+        super().update(player)
+
+        # If Voltrak is dead, nothing left to do
+        if self.state == STATE_DEAD:
+            return
+
+        # Phase 2 kicks in at half health — Voltrak gets angrier!
+        phase2 = self.health <= self.max_health * self.PHASE2_THRESHOLD
+        self.speed = 3 if phase2 else 2
+        shock_interval = self.SHOCK_INTERVAL_PHASE2 if phase2 else self.SHOCK_INTERVAL_PHASE1
+
+        # Age existing shock zones — remove any that have expired (timer reaches 0)
+        self.shock_zones = [[rect, t - 1] for rect, t in self.shock_zones if t > 1]
+
+        # Count down toward the next shock volley
+        self.shock_timer -= 1
+        if self.shock_timer <= 0:
+            self.shock_timer = shock_interval
+            self._fire_shocks()
+            self.shock_just_fired = True   # Signal main.py to check collision THIS frame!
+
+    def _fire_shocks(self):
+        """Fire electric shock bolts in all 4 cardinal directions.
+
+        Each bolt is a thin rectangle stretching SHOCK_RANGE pixels from
+        Voltrak's centre. main.py checks player collision immediately
+        after shock_just_fired is set to deal damage.
+        """
+        # Centre of Voltrak's sprite — bolts shoot outward from here
+        cx = self.x + self.sprite_width  // 2
+        cy = self.y + self.sprite_height // 2
+
+        r = self.SHOCK_RANGE
+        t = self.SHOCK_THICKNESS
+        d = self.SHOCK_DURATION
+
+        # Shoot bolts right, left, down, and up — a cross-shaped electric blast!
+        self.shock_zones.append([pygame.Rect(cx,        cy - t//2, r, t), d])   # Right
+        self.shock_zones.append([pygame.Rect(cx - r,    cy - t//2, r, t), d])   # Left
+        self.shock_zones.append([pygame.Rect(cx - t//2, cy,        t, r), d])   # Down
+        self.shock_zones.append([pygame.Rect(cx - t//2, cy - r,    t, r), d])   # Up
+
+    def draw_shocks(self, screen):
+        """Draw all active shock zones as glowing electric bolts.
+
+        The bolts fade from bright cyan to transparent as their timer counts down.
+        A bright white core over a wide cyan glow gives the electric feel!
+        """
+        if not self.shock_zones:
+            return
+
+        # Draw all shock zones onto a single transparent surface,
+        # then blit it to screen — this lets us use per-pixel alpha (transparency)!
+        shock_surf = pygame.Surface((screen.get_width(), screen.get_height()), pygame.SRCALPHA)
+
+        for zone_rect, timer_remaining in self.shock_zones:
+            fade = timer_remaining / self.SHOCK_DURATION   # 1.0 = fresh, 0.0 = expired
+
+            # Outer glow: wide cyan rectangle, fades out over time
+            outer_alpha = int(130 * fade)
+            pygame.draw.rect(shock_surf, (80, 200, 255, outer_alpha), zone_rect, border_radius=4)
+
+            # Bright white core: a narrower inset rectangle, stays bright longer
+            inset  = 6
+            inner  = zone_rect.inflate(-inset * 2, -inset * 2)
+            if inner.width > 0 and inner.height > 0:
+                inner_alpha = int(220 * fade)
+                pygame.draw.rect(shock_surf, (220, 240, 255, inner_alpha), inner, border_radius=2)
+
+        screen.blit(shock_surf, (0, 0))
+
+    def _die(self):
+        """Voltrak is defeated — the world of Lumoria is saved!
+
+        We set just_died = True so main.py knows to trigger the victory screen.
+        No potion drop needed — winning IS the reward!
+        """
+        self.state        = STATE_DEAD
+        self.respawn_ticks = 0
+        self.just_died    = True    # main.py watches this flag to trigger the victory screen!
+        self.boss_potion_drop = False   # No big potion — you just WON the game!
+        self.potion_drop  = False
 
 
 # ------------------------------------------------------------

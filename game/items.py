@@ -271,6 +271,47 @@ class HealthPotion(Item):
 
 
 # ---------------------------------------------------------------------------
+# BigHealthPotion — golden full-heal potion dropped only by mini-bosses
+# ---------------------------------------------------------------------------
+
+class BigHealthPotion(Item):
+    """A glowing golden health potion dropped only by mini-bosses.
+
+    Walking over it completely restores ALL your health — you're fully healed!
+
+    Sprite file: item_big_health_potion.png
+      - 20 x 20 pixels, single static image
+      - Gold coloured placeholder if the art file isn't ready yet
+    """
+
+    def __init__(self, x, y):
+        super().__init__(x, y)
+        # Load the big potion image.
+        # Gold fallback colour if the art file isn't there yet.
+        self.sprite = _load_static_sprite(
+            "item_big_health_potion.png",
+            width=20,
+            height=20,
+            fallback_color=(255, 215, 0),   # Shiny gold placeholder!
+        )
+
+    def _get_center(self):
+        """Centre of a 20x20 big potion sprite."""
+        return (self.x + 10, self.y + 10)
+
+    def _on_collected(self, player):
+        """Picking up a big health potion restores ALL your health — full heal!"""
+        player.restore_health(player.max_health)   # restore_health caps at max, so this fills it!
+
+    def draw(self, screen):
+        """Draw the big potion, shifted up or down by the float animation."""
+        if self.collected:
+            return
+        draw_y = self.y + int(self.float_offset)
+        screen.blit(self.sprite, (self.x, draw_y))
+
+
+# ---------------------------------------------------------------------------
 # PortalKey — dropped when both mini-bosses are defeated, opens the portal gate
 # ---------------------------------------------------------------------------
 
