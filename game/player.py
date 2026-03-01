@@ -28,20 +28,27 @@ RUN_SPEED  = 6   # Pixels the player moves per frame when running (hold Shift)
 START_HEALTH = 10
 
 # ---------------------------------------------------------------------------
-# Per-class stats — each character class starts with different Strength,
+# Per-class stats — each character class starts with different HP, Strength,
 # Magic, and Endurance values to make each class feel unique!
 #
+# max_health    (how many hit points you start with — different for each class!)
 # STR = Strength   (used for physical weapons like swords and pickaxes)
 # MAG = Magic      (used for magic weapons like staffs and laser beams)
 # max_endurance    (how much endurance you start with)
 # ---------------------------------------------------------------------------
 CLASS_STATS = {
-    "Wizard":   {"strength": 1, "magic": 5, "max_endurance": 2},
-    "Knight":   {"strength": 5, "magic": 1, "max_endurance": 4},
-    "Assassin": {"strength": 3, "magic": 2, "max_endurance": 5},
-    "Miner":    {"strength": 4, "magic": 1, "max_endurance": 3},
-    "Ninja":    {"strength": 3, "magic": 2, "max_endurance": 5},
-    "Robot":    {"strength": 4, "magic": 2, "max_endurance": 3},
+    # Wizard: glass cannon — low HP and endurance, but super high magic power
+    "Wizard":   {"max_health":  8, "strength": 1, "magic": 6, "max_endurance": 2},
+    # Knight: tank — lots of HP and strength, not much magic
+    "Knight":   {"max_health": 14, "strength": 5, "magic": 1, "max_endurance": 4},
+    # Assassin: speedy — lots of endurance to run and dodge, good strength
+    "Assassin": {"max_health":  9, "strength": 4, "magic": 1, "max_endurance": 6},
+    # Miner: tough brawler — good HP and strength, slow but hits hard
+    "Miner":    {"max_health": 12, "strength": 5, "magic": 1, "max_endurance": 3},
+    # Ninja: balanced — medium everything, good speed and technique
+    "Ninja":    {"max_health": 10, "strength": 3, "magic": 3, "max_endurance": 5},
+    # Robot: tech hybrid — mix of physical strength and magic lasers
+    "Robot":    {"max_health": 11, "strength": 4, "magic": 3, "max_endurance": 3},
 }
 
 # ---------------------------------------------------------------------------
@@ -78,9 +85,30 @@ SPRITE_SIZE = 48
 # ATTACK_BASE_DAMAGE: the flat damage before adding STR or MAG.
 #   Total damage = ATTACK_BASE_DAMAGE + strength (or magic for magic weapons).
 # ---------------------------------------------------------------------------
-ATTACK_COOLDOWN    = 30   # Frames to wait between attacks (30 = 0.5 s at 60 FPS)
+ATTACK_COOLDOWN    = 30   # Default frames to wait between attacks (30 = 0.5 s at 60 FPS)
 ATTACK_RANGE_PX    = 50   # Pixels from player center — enemies inside this square get hit
 ATTACK_BASE_DAMAGE =  1   # Base hit damage before adding the player's stat
+
+# ---------------------------------------------------------------------------
+# Per-weapon cooldowns — melee weapons can swing more frequently than ranged.
+# Ranged weapons are longer cooldown to balance their "safe distance" advantage.
+# ---------------------------------------------------------------------------
+WEAPON_COOLDOWNS = {
+    "staff":    30,   # 0.5 s — snappy area blast
+    "sword":    30,   # 0.5 s — standard sword swing
+    "daggers":  20,   # 0.33 s — fast stabber, but short range
+    "pickaxe":  45,   # 0.75 s — heavy and slow, but wide arc
+    "shuriken": 50,   # 0.83 s — reach back for another throwing star
+    "laser":    60,   # 1.0 s — recharge the energy cell between blasts
+}
+
+# ---------------------------------------------------------------------------
+# Assassin daggers: special damage rules!
+# Daggers are SO sharp that they one-shot any regular enemy.
+# Mini-bosses survive longer — it takes 3 hits to bring them down.
+# ---------------------------------------------------------------------------
+ASSASSIN_REGULAR_MULTIPLIER   = 999   # Effectively one-shots any normal enemy
+ASSASSIN_MINIBOSS_MULTIPLIER  = 0.34  # Fraction of max HP per hit (3 hits to kill)
 
 # ---------------------------------------------------------------------------
 # Endurance constants — controls how the endurance bar is spent and refills
@@ -125,14 +153,15 @@ class Player(pygame.sprite.Sprite):
 
         self.character_class = character_class
 
-        # --- Health ---
-        # All characters start with the same HP, no matter which class they pick
-        self.health     = START_HEALTH
-        self.max_health = START_HEALTH
-
-        # --- Class-specific stats (Strength, Magic, Endurance) ---
+        # --- Class-specific stats (HP, Strength, Magic, Endurance) ---
         # Look up this class's starting numbers from the CLASS_STATS table above
         stats = CLASS_STATS[character_class]
+
+        # --- Health ---
+        # Each class has its own starting HP — set by CLASS_STATS above!
+        self.max_health = stats["max_health"]   # Each class has its own starting HP!
+        self.health     = self.max_health
+
         self.strength       = stats["strength"]
         self.magic          = stats["magic"]
         self.max_endurance  = stats["max_endurance"]
@@ -156,6 +185,11 @@ class Player(pygame.sprite.Sprite):
         self.x     = screen_width  // 2 - SPRITE_SIZE // 2
         self.y     = screen_height // 2 - SPRITE_SIZE // 2
         self.speed = WALK_SPEED
+
+        # --- Facing direction ---
+        # Which way is the player looking? Used to aim weapon attacks!
+        # "right", "left", "up", or "down"
+        self.facing = "right"
 
         # --- Animation state ---
         self.animations          = load_player_animations(character_class)
@@ -181,6 +215,10 @@ class Player(pygame.sprite.Sprite):
         self.is_dead_flag = False   # True while showing the "You died!" screen
         self.death_timer  = 0       # Counts down to 0, then we respawn
 
+        # --- Sprite dimensions (used by attack zone calculations) ---
+        self.sprite_width  = SPRITE_SIZE
+        self.sprite_height = SPRITE_SIZE
+
         # --- Font for drawing the character name below the sprite ---
         self.label_font = pygame.font.SysFont("Arial", 12)
 
@@ -188,12 +226,13 @@ class Player(pygame.sprite.Sprite):
     # Input handling — called every frame from main.py
     # -----------------------------------------------------------------------
 
-    def handle_input(self, keys_pressed):
+    def handle_input(self, keys_pressed, touch_input=None):
         """Read which keys are held down and move / animate the player.
 
         This is called once every frame (60 times per second).
 
         keys_pressed -- a dictionary from pygame that says which keys are held
+        touch_input  -- optional virtual-control state from main.py
         """
         # Reset the attack signal at the start of every frame.
         # It was set to True last frame (when Space was pressed); now we clear it
@@ -205,8 +244,14 @@ class Player(pygame.sprite.Sprite):
         if self.attack_cooldown_ticks > 0:
             self.attack_cooldown_ticks -= 1
 
-        # Check if the player wants to run (holding Shift)
-        running = keys_pressed[pygame.K_LSHIFT] or keys_pressed[pygame.K_RSHIFT]
+        touch_input = touch_input or {}
+
+        # Check if the player wants to run (holding Shift or pushing joystick far)
+        running = (
+            keys_pressed[pygame.K_LSHIFT]
+            or keys_pressed[pygame.K_RSHIFT]
+            or touch_input.get("run", False)
+        )
 
         # --- Endurance cost for running ---
         # Running spends endurance every frame. When it runs out, the player
@@ -224,11 +269,33 @@ class Player(pygame.sprite.Sprite):
         old_x = self.x
         old_y = self.y
 
-        # Move in four directions (arrow keys or WASD)
-        if keys_pressed[pygame.K_UP]    or keys_pressed[pygame.K_w]: self.y -= self.speed
-        if keys_pressed[pygame.K_DOWN]  or keys_pressed[pygame.K_s]: self.y += self.speed
-        if keys_pressed[pygame.K_LEFT]  or keys_pressed[pygame.K_a]: self.x -= self.speed
-        if keys_pressed[pygame.K_RIGHT] or keys_pressed[pygame.K_d]: self.x += self.speed
+        # Calculate how far to move in each direction this frame
+        dx = 0
+        dy = 0
+
+        if keys_pressed[pygame.K_LEFT] or keys_pressed[pygame.K_a] or touch_input.get("left", False):
+            dx -= self.speed
+        if keys_pressed[pygame.K_RIGHT] or keys_pressed[pygame.K_d] or touch_input.get("right", False):
+            dx += self.speed
+        if keys_pressed[pygame.K_UP] or keys_pressed[pygame.K_w] or touch_input.get("up", False):
+            dy -= self.speed
+        if keys_pressed[pygame.K_DOWN] or keys_pressed[pygame.K_s] or touch_input.get("down", False):
+            dy += self.speed
+
+        self.x += dx
+        self.y += dy
+
+        # --- Update facing direction ---
+        # Only change facing when actually moving — standing still keeps the last direction.
+        # We check horizontal first so left/right takes priority when moving diagonally.
+        if dx > 0:
+            self.facing = "right"
+        elif dx < 0:
+            self.facing = "left"
+        elif dy > 0:
+            self.facing = "down"
+        elif dy < 0:
+            self.facing = "up"
 
         moved = (self.x != old_x) or (self.y != old_y)
 
@@ -249,6 +316,30 @@ class Player(pygame.sprite.Sprite):
 
         self._advance_animation()
 
+    def try_attack(self):
+        """Try to start an attack and return True when successful."""
+        if self.attack_cooldown_ticks > 0:
+            return False
+
+        # Can't attack without any endurance!
+        if self.endurance <= 0:
+            return False
+
+        # Tell main.py "an attack happened THIS frame — check enemy hits!"
+        self.attacking = True
+
+        # Start the cooldown timer — each weapon has its own wait time!
+        self.attack_cooldown_ticks = WEAPON_COOLDOWNS.get(self.weapon_type, ATTACK_COOLDOWN)
+
+        # Spend some endurance for the attack
+        self.use_endurance(ENDURANCE_ATTACK_COST)
+
+        # Switch to the attack animation and restart it from the very first frame
+        self.current_animation   = "attack"
+        self.current_frame_index = 0
+        self.frame_tick          = 0
+        return True
+
     def handle_attack(self, event):
         """Check if the player pressed Space to attack.
 
@@ -258,24 +349,8 @@ class Player(pygame.sprite.Sprite):
 
         event -- the pygame KEYDOWN event that just happened
         """
-        if event.key == pygame.K_SPACE and self.attack_cooldown_ticks <= 0:
-            # Can't attack without any endurance!
-            if self.endurance <= 0:
-                return
-
-            # Tell main.py "an attack happened THIS frame — check enemy hits!"
-            self.attacking = True
-
-            # Start the cooldown timer so the player has to wait before attacking again
-            self.attack_cooldown_ticks = ATTACK_COOLDOWN
-
-            # Spend some endurance for the attack
-            self.use_endurance(ENDURANCE_ATTACK_COST)
-
-            # Switch to the attack animation and restart it from the very first frame
-            self.current_animation   = "attack"
-            self.current_frame_index = 0
-            self.frame_tick          = 0
+        if event.key == pygame.K_SPACE:
+            self.try_attack()
 
     # -----------------------------------------------------------------------
     # Screen boundary — called every frame from main.py after handle_input
@@ -293,21 +368,98 @@ class Player(pygame.sprite.Sprite):
     # Attack helpers — used by main.py
     # -----------------------------------------------------------------------
 
-    def get_attack_rect(self):
-        """Return a rectangle showing the area that the player's attack can reach.
+    def get_attack_zones(self):
+        """Return a list of rectangles showing the areas this weapon can hit.
 
-        Any enemy whose rectangle overlaps this one takes damage when self.attacking is True.
-        The rectangle is centered on the player and extends ATTACK_RANGE_PX in all directions.
+        Different weapons hit different shapes and directions:
+        - Staff (Wizard): big burst in all directions around the player
+        - Sword (Knight): forward slash — medium rect in the direction you're facing
+        - Daggers (Assassin): short close thrust — very close range in front
+        - Pickaxe (Miner): wide heavy swing — wider than the sword
+        - Shuriken (Ninja): ranged projectile — no melee zone, returns empty list!
+        - Laser (Robot): ranged beam — no melee zone, returns empty list!
+
+        We use the player's CENTER point to build the zones so the hit area
+        is always centered on the character, no matter which direction they face.
         """
-        center_x = self.x + SPRITE_SIZE // 2
-        center_y = self.y + SPRITE_SIZE // 2
+        # Player center point — our reference for all hit zones
+        cx = self.x + self.sprite_width  // 2
+        cy = self.y + self.sprite_height // 2
 
-        return pygame.Rect(
-            center_x - ATTACK_RANGE_PX,
-            center_y - ATTACK_RANGE_PX,
-            ATTACK_RANGE_PX * 2,
-            ATTACK_RANGE_PX * 2,
-        )
+        if self.weapon_type == "staff":
+            # Wizard staff: big magic burst centered on the player!
+            # 100x100 px circle (well, square) of pure magical energy.
+            return [pygame.Rect(cx - 50, cy - 50, 100, 100)]
+
+        elif self.weapon_type == "sword":
+            # Knight sword: a forward slash — 80px wide, 50px deep.
+            # The rect extends OUT from the player in the direction they're facing.
+            w, h = 80, 50
+            if self.facing == "right":
+                return [pygame.Rect(cx + 4,     cy - h // 2, w, h)]
+            elif self.facing == "left":
+                return [pygame.Rect(cx - 4 - w, cy - h // 2, w, h)]
+            elif self.facing == "down":
+                return [pygame.Rect(cx - w // 2, cy + 4,     h, w)]
+            else:  # up
+                return [pygame.Rect(cx - w // 2, cy - 4 - w, h, w)]
+
+        elif self.weapon_type == "daggers":
+            # Assassin daggers: a short close thrust — 40px wide, 32px deep.
+            # Very close range but super deadly!
+            w, h = 40, 32
+            if self.facing == "right":
+                return [pygame.Rect(cx + 4,     cy - h // 2, w, h)]
+            elif self.facing == "left":
+                return [pygame.Rect(cx - 4 - w, cy - h // 2, w, h)]
+            elif self.facing == "down":
+                return [pygame.Rect(cx - w // 2, cy + 4,     h, w)]
+            else:  # up
+                return [pygame.Rect(cx - w // 2, cy - 4 - w, h, w)]
+
+        elif self.weapon_type == "pickaxe":
+            # Miner pickaxe: wide heavy arc — 110px wide, 40px deep.
+            # Slower weapon but hits a BIG area!
+            w, h = 110, 40
+            if self.facing == "right":
+                return [pygame.Rect(cx + 4,     cy - h // 2, w, h)]
+            elif self.facing == "left":
+                return [pygame.Rect(cx - 4 - w, cy - h // 2, w, h)]
+            elif self.facing == "down":
+                return [pygame.Rect(cx - w // 2, cy + 4,     h, w)]
+            else:  # up
+                return [pygame.Rect(cx - w // 2, cy - 4 - w, h, w)]
+
+        elif self.weapon_type == "laser":
+            # Robot laser: instant beam — long and thin in the facing direction.
+            # 400 px long, 12 px thick. Hits ALL enemies along the beam in one frame!
+            beam_len   = 400
+            beam_thick = 12
+            if self.facing == "right":
+                return [pygame.Rect(cx + 4,            cy - beam_thick // 2, beam_len,   beam_thick)]
+            elif self.facing == "left":
+                return [pygame.Rect(cx - 4 - beam_len, cy - beam_thick // 2, beam_len,   beam_thick)]
+            elif self.facing == "down":
+                return [pygame.Rect(cx - beam_thick // 2, cy + 4,            beam_thick, beam_len)]
+            else:  # up
+                return [pygame.Rect(cx - beam_thick // 2, cy - 4 - beam_len, beam_thick, beam_len)]
+
+        elif self.weapon_type == "shuriken":
+            # Shuriken is a flying projectile — NO melee zone here.
+            # main.py spawns a Projectile when the Ninja attacks.
+            return []
+
+        # Default fallback (shouldn't happen, but just in case!)
+        return []
+
+    def is_ranged_weapon(self):
+        """Returns True if this weapon fires a flying projectile.
+
+        Only the Ninja's shuriken is a true projectile now.
+        The Robot's laser is an instant beam handled as a wide attack zone,
+        so it returns False here — get_attack_zones() gives it its long thin rect.
+        """
+        return self.weapon_type == "shuriken"
 
     def get_attack_damage(self):
         """Calculate how much damage this player deals per hit.
@@ -322,6 +474,22 @@ class Player(pygame.sprite.Sprite):
             return ATTACK_BASE_DAMAGE + self.magic
         else:
             return ATTACK_BASE_DAMAGE + self.strength
+
+    def get_assassin_damage(self, target_max_hp, is_miniboss):
+        """Special dagger damage — one-shots normal enemies, needs 3 hits for mini-bosses.
+
+        Daggers are amazing against regular monsters — one strike and they're gone!
+        Mini-bosses are tough though, so even daggers need 3 hits to take them down.
+
+        target_max_hp -- the maximum health of the enemy being hit
+        is_miniboss   -- True if the target is a mini-boss (Grimrak, Zara, etc.)
+        """
+        if is_miniboss:
+            # Deal 1/3 of the boss's max HP each hit — so it takes exactly 3 hits
+            return max(1, int(target_max_hp * ASSASSIN_MINIBOSS_MULTIPLIER))
+        else:
+            # Daggers are deadly — one shot for any regular enemy!
+            return target_max_hp + 1
 
     # -----------------------------------------------------------------------
     # Leveling up
@@ -374,12 +542,12 @@ class Player(pygame.sprite.Sprite):
         """Bring the player back to life at a respawn point.
 
         x, y -- the pixel coordinates of the respawn spot.
-        The player comes back with 50% of their max health (at least 1 HP).
+        The player comes back with FULL health — you're back!
         Endurance is fully restored on respawn.
         """
         self.x = x
         self.y = y
-        self.health     = max(1, self.max_health // 2)   # 50% health, never zero
+        self.health     = self.max_health   # Full health — you're back!
         self.endurance  = self.max_endurance              # Full endurance!
         self.is_dead_flag = False
         self.death_timer  = 0

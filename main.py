@@ -443,6 +443,13 @@ def draw_victory_screen(screen, title_font, body_font):
     hint = body_font.render("Press Space to return to the menu", True, (180, 180, 180))
     screen.blit(hint, (SCREEN_WIDTH // 2 - hint.get_width() // 2, SCREEN_HEIGHT // 2 + 70))
 
+    # Touch return button
+    return_rect = get_end_screen_return_rect()
+    pygame.draw.rect(screen, (80, 110, 60), return_rect, border_radius=10)
+    return_text = body_font.render("Return to Menu", True, (255, 255, 255))
+    screen.blit(return_text, (return_rect.centerx - return_text.get_width() // 2,
+                              return_rect.centery - return_text.get_height() // 2))
+
 
 # ── Helper: Draw the HUD ───────────────────────────────────
 
@@ -576,6 +583,25 @@ def draw_level_up_overlay(screen, player, level_up_fonts, level_up_surfaces):
         screen.blit(line_surface, (line_x, line_y))
 
 
+def get_level_up_touch_targets(player, level_up_fonts):
+    """Return tap targets for the 4 level-up choices."""
+    options = [
+        ("health",    f"  1  —  Health:  +2 Max HP     (now {player.max_health + 2})"),
+        ("endurance", f"  2  —  Endurance:  +2 Max EN     (now {player.max_endurance + 2})"),
+        ("strength",  f"  3  —  Strength:  +1 STR        (now {player.strength + 1})"),
+        ("magic",     f"  4  —  Magic:  +1 MAG        (now {player.magic + 1})"),
+    ]
+    targets = []
+    for i, (stat_id, line_text) in enumerate(options):
+        line_surface = level_up_fonts["body"].render(line_text, True, (255, 255, 255))
+        line_x = SCREEN_WIDTH // 2 - line_surface.get_width() // 2
+        line_y = LEVELUP_PANEL_Y + 110 + i * 38
+        rect = pygame.Rect(line_x - 12, line_y - 4,
+                           line_surface.get_width() + 24, line_surface.get_height() + 10)
+        targets.append((stat_id, rect))
+    return targets
+
+
 # ── Helper: Draw the Death Screen ─────────────────────────
 
 def draw_death_screen(screen, death_font, lives_remaining):
@@ -612,6 +638,18 @@ def draw_game_over_screen(screen, title_font, body_font):
     hint_x = SCREEN_WIDTH // 2 - hint.get_width() // 2
     screen.blit(hint, (hint_x, SCREEN_HEIGHT // 2 + 30))
 
+    return_rect = get_end_screen_return_rect()
+    pygame.draw.rect(screen, (80, 110, 60), return_rect, border_radius=10)
+    return_text = body_font.render("Return to Menu", True, (255, 255, 255))
+    screen.blit(return_text, (return_rect.centerx - return_text.get_width() // 2,
+                              return_rect.centery - return_text.get_height() // 2))
+
+
+def get_end_screen_return_rect():
+    """Shared touch target for victory/game-over return button."""
+    width = min(460, SCREEN_WIDTH - 120)
+    return pygame.Rect(SCREEN_WIDTH // 2 - width // 2, SCREEN_HEIGHT // 2 + 90, width, 50)
+
 
 # ── Helper: Draw the "ESC = Menu" hint ────────────────────
 
@@ -621,6 +659,206 @@ def draw_esc_hint(screen, hint_font):
     hint_x = SCREEN_WIDTH  - hint_surface.get_width()  - 10
     hint_y = SCREEN_HEIGHT - hint_surface.get_height() - 10
     screen.blit(hint_surface, (hint_x, hint_y))
+
+
+def get_pointer_pos(event):
+    """Return pixel coordinates for mouse/touch events, or None."""
+    if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
+        return event.pos
+    if event.type in (pygame.FINGERDOWN, pygame.FINGERUP, pygame.FINGERMOTION):
+        surface = pygame.display.get_surface()
+        if surface is not None:
+            sw, sh = surface.get_size()
+        else:
+            sw, sh = SCREEN_WIDTH, SCREEN_HEIGHT
+        return (int(event.x * sw), int(event.y * sh))
+    return None
+
+
+def get_orientation(screen_w, screen_h):
+    """Return the logical orientation for touch layout."""
+    if screen_w >= screen_h:
+        return "landscape"
+    return "portrait"
+
+
+def build_touch_layout(screen_w, screen_h, orientation):
+    """Return touch-control geometry for the current orientation."""
+    pad = 16
+    base = max(72, int(min(screen_w, screen_h) * 0.11))
+    joystick_radius = max(70, int(base * 1.2))
+    attack_radius = max(40, int(base * 0.8))
+    interact_radius = max(38, int(base * 0.68))
+    pause_radius = max(24, int(base * 0.45))
+
+    if orientation == "portrait":
+        joy_center = (pad + joystick_radius, screen_h - pad - joystick_radius - 40)
+        atk_center = (screen_w - pad - attack_radius, screen_h - pad - attack_radius - 20)
+        interact_center = (
+            screen_w - pad - attack_radius - interact_radius * 2 - 20,
+            screen_h - pad - interact_radius - 90
+        )
+    else:
+        joy_center = (pad + joystick_radius, screen_h - pad - joystick_radius)
+        atk_center = (screen_w - pad - attack_radius, screen_h - pad - attack_radius)
+        interact_center = (
+            screen_w - pad - attack_radius - interact_radius * 2 - 26,
+            screen_h - pad - interact_radius - 18
+        )
+
+    pause_center = (screen_w - pad - pause_radius, pad + pause_radius)
+    return {
+        "joystick_center": joy_center,
+        "joystick_radius": joystick_radius,
+        "knob_radius": max(24, int(joystick_radius * 0.40)),
+        "attack_center": atk_center,
+        "attack_radius": attack_radius,
+        "interact_center": interact_center,
+        "interact_radius": interact_radius,
+        "pause_center": pause_center,
+        "pause_radius": pause_radius,
+    }
+
+
+class TouchControls:
+    """Virtual joystick + action buttons for touchscreen play."""
+
+    DEAD_ZONE = 0.22
+    RUN_THRESHOLD = 0.72
+
+    def __init__(self, hud_font):
+        self.hud_font = hud_font
+        self.layout = {}
+        self.orientation = "landscape"
+        self.update_layout(SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        self.move_pointer_id = None
+        self.move_vector = (0.0, 0.0)
+
+        self.attack_tapped = False
+        self.interact_tapped = False
+        self.pause_tapped = False
+
+        self.interact_enabled = False
+        self.interact_label = "USE"
+
+    def update_layout(self, screen_w, screen_h):
+        self.orientation = get_orientation(screen_w, screen_h)
+        self.layout = build_touch_layout(screen_w, screen_h, self.orientation)
+
+    def set_interact(self, enabled, label):
+        self.interact_enabled = enabled
+        self.interact_label = label if enabled else "USE"
+
+    def begin_frame(self):
+        self.attack_tapped = False
+        self.interact_tapped = False
+        self.pause_tapped = False
+
+    def _pointer_id(self, event):
+        if event.type in (pygame.FINGERDOWN, pygame.FINGERUP, pygame.FINGERMOTION):
+            return ("finger", event.finger_id)
+        return ("mouse", 0)
+
+    def _distance_sq(self, p1, p2):
+        dx = p1[0] - p2[0]
+        dy = p1[1] - p2[1]
+        return dx * dx + dy * dy
+
+    def _set_move_vector_from_pos(self, pos):
+        cx, cy = self.layout["joystick_center"]
+        radius = float(self.layout["joystick_radius"])
+        nx = max(-1.0, min(1.0, (pos[0] - cx) / radius))
+        ny = max(-1.0, min(1.0, (pos[1] - cy) / radius))
+        self.move_vector = (nx, ny)
+
+    def _clear_move_if_matching_pointer(self, pointer_id):
+        if self.move_pointer_id == pointer_id:
+            self.move_pointer_id = None
+            self.move_vector = (0.0, 0.0)
+
+    def handle_event(self, event):
+        pos = get_pointer_pos(event)
+        if pos is None:
+            return
+        pointer_id = self._pointer_id(event)
+
+        if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
+            if event.type == pygame.MOUSEBUTTONDOWN and getattr(event, "button", 1) != 1:
+                return
+            if event.type == pygame.MOUSEBUTTONUP and getattr(event, "button", 1) != 1:
+                return
+            if event.type == pygame.MOUSEMOTION and not getattr(event, "buttons", (0, 0, 0))[0]:
+                return
+
+        if event.type in (pygame.FINGERDOWN, pygame.MOUSEBUTTONDOWN):
+            if self._distance_sq(pos, self.layout["joystick_center"]) <= self.layout["joystick_radius"] ** 2:
+                self.move_pointer_id = pointer_id
+                self._set_move_vector_from_pos(pos)
+                return
+            if self._distance_sq(pos, self.layout["attack_center"]) <= self.layout["attack_radius"] ** 2:
+                self.attack_tapped = True
+                return
+            if self.interact_enabled and (
+                self._distance_sq(pos, self.layout["interact_center"]) <= self.layout["interact_radius"] ** 2
+            ):
+                self.interact_tapped = True
+                return
+            if self._distance_sq(pos, self.layout["pause_center"]) <= self.layout["pause_radius"] ** 2:
+                self.pause_tapped = True
+                return
+
+        if event.type in (pygame.FINGERMOTION, pygame.MOUSEMOTION):
+            if self.move_pointer_id == pointer_id:
+                self._set_move_vector_from_pos(pos)
+            return
+
+        if event.type in (pygame.FINGERUP, pygame.MOUSEBUTTONUP):
+            self._clear_move_if_matching_pointer(pointer_id)
+
+    def get_player_input(self):
+        nx, ny = self.move_vector
+        mag_sq = nx * nx + ny * ny
+        if mag_sq < self.DEAD_ZONE * self.DEAD_ZONE:
+            return {"left": False, "right": False, "up": False, "down": False, "run": False}
+        mag = mag_sq ** 0.5
+        return {
+            "left": nx < -self.DEAD_ZONE,
+            "right": nx > self.DEAD_ZONE,
+            "up": ny < -self.DEAD_ZONE,
+            "down": ny > self.DEAD_ZONE,
+            "run": mag >= self.RUN_THRESHOLD,
+        }
+
+    def draw(self, screen):
+        # Joystick base + knob
+        joy_center = self.layout["joystick_center"]
+        joy_radius = self.layout["joystick_radius"]
+        pygame.draw.circle(screen, (40, 40, 40), joy_center, joy_radius)
+        pygame.draw.circle(screen, (200, 200, 200), joy_center, joy_radius, 3)
+        knob_x = int(joy_center[0] + self.move_vector[0] * joy_radius * 0.6)
+        knob_y = int(joy_center[1] + self.move_vector[1] * joy_radius * 0.6)
+        pygame.draw.circle(screen, (220, 220, 220), (knob_x, knob_y), self.layout["knob_radius"])
+
+        # Attack button
+        pygame.draw.circle(screen, (200, 35, 35), self.layout["attack_center"], self.layout["attack_radius"])
+        atk = self.hud_font.render("ATK", True, (255, 255, 255))
+        screen.blit(atk, (self.layout["attack_center"][0] - atk.get_width() // 2,
+                          self.layout["attack_center"][1] - atk.get_height() // 2))
+
+        # Interact button (context sensitive)
+        if self.interact_enabled:
+            pygame.draw.circle(screen, (180, 120, 20),
+                               self.layout["interact_center"], self.layout["interact_radius"])
+            use_surf = self.hud_font.render(self.interact_label, True, (255, 255, 255))
+            screen.blit(use_surf, (self.layout["interact_center"][0] - use_surf.get_width() // 2,
+                                   self.layout["interact_center"][1] - use_surf.get_height() // 2))
+
+        # Pause button
+        pygame.draw.circle(screen, (30, 30, 30), self.layout["pause_center"], self.layout["pause_radius"])
+        pause_surf = self.hud_font.render("II", True, (245, 200, 66))
+        screen.blit(pause_surf, (self.layout["pause_center"][0] - pause_surf.get_width() // 2,
+                                 self.layout["pause_center"][1] - pause_surf.get_height() // 2))
 
 
 # ── Helper: Draw the Pause Overlay ────────────────────────
@@ -648,32 +886,57 @@ def draw_pause_overlay(screen, pause_fonts, pause_surfaces, audio_enabled, selec
         "Arrow Keys / WASD  =  Move",
         "Shift              =  Run (costs Endurance)",
         "Space              =  Attack (costs Endurance)",
+        "Touch Joystick     =  Move / Run",
+        "Touch Buttons      =  ATK / USE / Pause",
         "P                  =  Pause / Unpause",
         "ESC                =  Return to Menu",
     ]
 
     for line_index, control_text in enumerate(controls_list):
         line_surface = pause_fonts["body"].render(control_text, True, PAUSE_BODY_COLOR)
-        line_y = panel_y + 110 + line_index * 26
+        line_y = panel_y + 108 + line_index * 23
         screen.blit(line_surface, (panel_x + 30, line_y))
 
     settings_heading = pause_fonts["section"].render("SETTINGS", True, PAUSE_TITLE_COLOR)
-    screen.blit(settings_heading, (panel_x + 30, panel_y + 240))
+    screen.blit(settings_heading, (panel_x + 30, panel_y + 248))
 
     audio_state_text = "ON" if audio_enabled else "OFF"
     audio_color = PAUSE_SELECT_COLOR if selected_setting_index == 0 else PAUSE_BODY_COLOR
 
     if selected_setting_index == 0:
         arrow_surface = pause_fonts["body"].render(">", True, PAUSE_SELECT_COLOR)
-        screen.blit(arrow_surface, (panel_x + 15, panel_y + 270))
+        screen.blit(arrow_surface, (panel_x + 15, panel_y + 278))
 
     audio_surface = pause_fonts["body"].render(f"Audio:  {audio_state_text}", True, audio_color)
-    screen.blit(audio_surface, (panel_x + 30, panel_y + 270))
+    screen.blit(audio_surface, (panel_x + 30, panel_y + 278))
 
-    footer_text = "P or ESC = Unpause   |   Up/Down = Navigate   |   Enter/Space = Toggle"
+    # Touch-friendly pause actions on the right side
+    pause_targets = get_pause_touch_targets()
+    pygame.draw.rect(screen, (60, 110, 80), pause_targets["resume"], border_radius=8)
+    pygame.draw.rect(screen, (120, 60, 60), pause_targets["menu"], border_radius=8)
+    resume_surf = pause_fonts["body"].render("Resume", True, (255, 255, 255))
+    menu_surf = pause_fonts["body"].render("Main Menu", True, (255, 255, 255))
+    screen.blit(resume_surf, (pause_targets["resume"].centerx - resume_surf.get_width() // 2,
+                              pause_targets["resume"].centery - resume_surf.get_height() // 2))
+    screen.blit(menu_surf, (pause_targets["menu"].centerx - menu_surf.get_width() // 2,
+                            pause_targets["menu"].centery - menu_surf.get_height() // 2))
+
+    footer_text = "Tap Resume/Audio/Menu  |  P/ESC = Unpause  |  Enter/Space = Toggle"
     footer_surface = pause_fonts["body"].render(footer_text, True, (160, 160, 160))
     footer_x = SCREEN_WIDTH // 2 - footer_surface.get_width() // 2
     screen.blit(footer_surface, (footer_x, panel_y + PAUSE_PANEL_HEIGHT - 35))
+
+
+def get_pause_touch_targets():
+    """Return tap targets for pause actions."""
+    panel_x = SCREEN_WIDTH  // 2 - PAUSE_PANEL_WIDTH  // 2
+    panel_y = SCREEN_HEIGHT // 2 - PAUSE_PANEL_HEIGHT // 2
+    targets = {
+        "resume": pygame.Rect(panel_x + 320, panel_y + 250, 160, 36),
+        "audio":  pygame.Rect(panel_x + 20, panel_y + 270, 220, 34),
+        "menu":   pygame.Rect(panel_x + 320, panel_y + 300, 160, 36),
+    }
+    return targets
 
 
 # ── Story Intro Screen ─────────────────────────────────────
@@ -707,6 +970,8 @@ async def run_story_intro(screen, clock, fonts):
                 if event.type == pygame.KEYDOWN:
                     if event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_ESCAPE):
                         waiting = False
+                elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN):
+                    waiting = False
 
             screen.fill(SELECT_SCREEN_BG)
 
@@ -724,7 +989,7 @@ async def run_story_intro(screen, clock, fonts):
                 screen.blit(text_surface, (text_x, y_cursor))
                 y_cursor += 44
 
-            hint = fonts["hint"].render("Press Space or Enter to continue", True, HERO_GOLD)
+            hint = fonts["hint"].render("Press Space/Enter or tap to continue", True, HERO_GOLD)
             hint_x = SCREEN_WIDTH // 2 - hint.get_width() // 2
             screen.blit(hint, (hint_x, SCREEN_HEIGHT - SELECT_HINT_OFFSET))
 
@@ -741,6 +1006,7 @@ async def run_character_selection(screen, clock, fonts):
     """Show the character selection screen and return the class the player chose."""
 
     chosen_class = None
+    option_hitboxes = []
 
     key_to_class = {
         pygame.K_1: CHARACTER_CLASSES[0],
@@ -751,6 +1017,23 @@ async def run_character_selection(screen, clock, fonts):
         pygame.K_6: CHARACTER_CLASSES[5],
     }
 
+    for index, class_name in enumerate(CHARACTER_CLASSES):
+        option_text = f"  {index + 1}  —  {class_name}"
+        option_surface = fonts["small"].render(option_text, True, SELECT_SCREEN_TEXT)
+        option_x = SCREEN_WIDTH // 2 - option_surface.get_width() // 2
+        option_y = SELECT_OPTIONS_Y + index * SELECT_OPTION_GAP
+        hitbox = pygame.Rect(option_x - 20, option_y - 6,
+                             option_surface.get_width() + 40, option_surface.get_height() + 12)
+        option_hitboxes.append((class_name, hitbox))
+
+    quit_label = fonts["hint"].render("Quit", True, (255, 220, 220))
+    quit_rect = pygame.Rect(
+        SCREEN_WIDTH // 2 - quit_label.get_width() // 2 - 20,
+        SCREEN_HEIGHT - SELECT_HINT_OFFSET - 42,
+        quit_label.get_width() + 40,
+        quit_label.get_height() + 12,
+    )
+
     while chosen_class is None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -759,6 +1042,16 @@ async def run_character_selection(screen, clock, fonts):
                 if event.key in key_to_class:
                     chosen_class = key_to_class[event.key]
                 elif event.key == pygame.K_ESCAPE:
+                    return None
+            elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN):
+                pointer_pos = get_pointer_pos(event)
+                if pointer_pos is None:
+                    continue
+                for class_name, rect in option_hitboxes:
+                    if rect.collidepoint(pointer_pos):
+                        chosen_class = class_name
+                        break
+                if quit_rect.collidepoint(pointer_pos):
                     return None
 
         screen.fill(SELECT_SCREEN_BG)
@@ -779,9 +1072,12 @@ async def run_character_selection(screen, clock, fonts):
             screen.blit(option_surface, (option_x, option_y))
 
         hint_surface = fonts["hint"].render(
-            "Press 1 - 6 to choose your character   |   ESC = Quit", True, HERO_GOLD)
+            "Press 1 - 6 or tap a hero   |   ESC = Quit", True, HERO_GOLD)
         hint_x = SCREEN_WIDTH // 2 - hint_surface.get_width() // 2
         screen.blit(hint_surface, (hint_x, SCREEN_HEIGHT - SELECT_HINT_OFFSET))
+        pygame.draw.rect(screen, (90, 40, 40), quit_rect, border_radius=8)
+        screen.blit(quit_label, (quit_rect.centerx - quit_label.get_width() // 2,
+                                 quit_rect.centery - quit_label.get_height() // 2))
 
         pygame.display.flip()
         clock.tick(TARGET_FPS)
@@ -942,16 +1238,113 @@ async def main():
 
         # Reusable slam warning surface to avoid creating a new one every draw frame.
         slam_warning_surf = pygame.Surface((130, 130), pygame.SRCALPHA)
+        touch_controls = TouchControls(hud_font)
+
+        def handle_interact_action():
+            """Handle the same behavior as pressing E."""
+            nonlocal portal_open, arena_mode, world
+
+            # First, try interacting with the Summoner if the player is close.
+            summoner_rect = pygame.Rect(
+                summoner.x, summoner.y, summoner.sprite_width, summoner.sprite_height
+            )
+            player_rect = pygame.Rect(
+                player.x, player.y, player.sprite_width, player.sprite_height
+            )
+            if summoner_rect.inflate(80, 80).colliderect(player_rect):
+                summon_result = summoner.on_interact()
+                if summon_result == "summon":
+                    fighter_companions.append(CompanionFighter(player.x + 20, player.y + 20))
+
+            # The portal gate is 96 px wide and 128 px tall.
+            portal_rect = pygame.Rect(PORTAL_X, PORTAL_Y, 96, 128)
+            near_portal = portal_rect.inflate(40, 40).colliderect(player_rect)
+            if player.has_portal_key and near_portal and not portal_open:
+                portal_open = True
+                arena_mode = True
+                world = VoltrakArena()
+                player.x, player.y = 600, 330
+                fighter_companions.clear()
+
+                if summoner.pre_activated_voltrak:
+                    fighter_companions.append(CompanionFighter(480, 300))
+                    fighter_companions.append(CompanionFighter(720, 300))
+                else:
+                    fighter_companions.append(CompanionFighter(560, 300))
+
+                if not voltrak_list:
+                    voltrak_list.append(Voltrak(550, 280))
+
+                enemy_list.clear()
+                miniboss_list.clear()
+                item_list.clear()
+                enemy_proj_list.clear()
+
+        def handle_attack_action():
+            """Handle the same behavior as pressing Space to attack."""
+            attacked = player.try_attack()
+            if not attacked:
+                return
+
+            sounds.play("attack_swing")
+
+            if player.is_ranged_weapon():
+                facing_vectors = {
+                    "right": (1, 0), "left": (-1, 0),
+                    "down":  (0, 1), "up":   (0, -1),
+                }
+                fdx, fdy = facing_vectors.get(player.facing, (1, 0))
+                speed = Projectile.SHURIKEN_SPEED
+                px = player.x + player.sprite_width  // 2 - Projectile.SHURIKEN_SIZE // 2
+                py = player.y + player.sprite_height // 2 - Projectile.SHURIKEN_SIZE // 2
+                proj = Projectile(px, py, fdx * speed, fdy * speed,
+                                  "shuriken", player.get_attack_damage())
+                projectile_list.append(proj)
+            else:
+                zones = player.get_attack_zones()
+                if zones:
+                    attack_effects.append(AttackEffect(zones, player.weapon_type))
+
+        def get_interact_context():
+            """Return whether interact should be enabled and its touch label."""
+            player_rect = pygame.Rect(player.x, player.y, player.sprite_width, player.sprite_height)
+
+            # Summoner has priority when nearby.
+            summoner_rect = pygame.Rect(
+                summoner.x, summoner.y, summoner.sprite_width, summoner.sprite_height
+            )
+            near_summoner = summoner_rect.inflate(80, 80).colliderect(player_rect)
+            if near_summoner:
+                if summoner.phase == 2 and not summoner.pre_activated_voltrak:
+                    return True, "ACT"
+                if summoner.can_summon():
+                    return True, "SUM"
+
+            portal_rect = pygame.Rect(PORTAL_X, PORTAL_Y, 96, 128)
+            near_portal = portal_rect.inflate(40, 40).colliderect(player_rect)
+            if player.has_portal_key and near_portal and not portal_open:
+                return True, "ENTER"
+
+            return False, "USE"
 
         # ── Game Loop ──────────────────────────────────────
         game_running = True
         while game_running:
+            sw, sh = screen.get_size()
+            touch_controls.update_layout(sw, sh)
+            touch_controls.begin_frame()
+
+            interact_enabled, interact_label = get_interact_context()
+            touch_controls.set_interact(interact_enabled, interact_label)
 
             # ── Handle Events ──────────────────────────────
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     game_running = False
                     app_running  = False
+
+                # Feed touch/mouse events into the virtual controls.
+                touch_controls.handle_event(event)
 
                 if event.type == pygame.KEYDOWN:
 
@@ -1000,82 +1393,55 @@ async def main():
 
                     # ── E: enter the portal — only when close to it AND holding the key ──
                     elif event.key == pygame.K_e:
-                        # First, try interacting with the Summoner if the player is close.
-                        summoner_rect = pygame.Rect(
-                            summoner.x, summoner.y, summoner.sprite_width, summoner.sprite_height
-                        )
-                        player_rect = pygame.Rect(
-                            player.x, player.y, player.sprite_width, player.sprite_height
-                        )
-                        if summoner_rect.inflate(80, 80).colliderect(player_rect):
-                            summon_result = summoner.on_interact()
-                            if summon_result == "summon":
-                                fighter_companions.append(CompanionFighter(player.x + 20, player.y + 20))
-                            elif summon_result == "pre_activate":
-                                # The flag is stored in the Summoner object and used at portal entry.
-                                pass
-
-                        # The portal gate is 96 px wide and 128 px tall.
-                        # We check if the player is close enough to step through it.
-                        portal_rect = pygame.Rect(PORTAL_X, PORTAL_Y, 96, 128)
-                        near_portal = portal_rect.inflate(40, 40).colliderect(player_rect)
-                        if player.has_portal_key and near_portal and not portal_open:
-                            # Enter Voltrak's arena.
-                            portal_open = True
-                            arena_mode = True
-                            world = VoltrakArena()
-                            player.x, player.y = 600, 330
-                            fighter_companions.clear()
-
-                            # 2 fighters if pre-activated at the Summoner, otherwise 1.
-                            if summoner.pre_activated_voltrak:
-                                fighter_companions.append(CompanionFighter(480, 300))
-                                fighter_companions.append(CompanionFighter(720, 300))
-                            else:
-                                fighter_companions.append(CompanionFighter(560, 300))
-
-                            # Voltrak spawns in the middle of the arena.
-                            if not voltrak_list:
-                                voltrak_list.append(Voltrak(550, 280))
-
-                            # Clear old world entities when entering the final arena.
-                            enemy_list.clear()
-                            miniboss_list.clear()
-                            item_list.clear()
-                            enemy_proj_list.clear()
+                        handle_interact_action()
 
                     # ── Space: attack — only when playing normally ──
                     elif event.key == pygame.K_SPACE:
-                        player.handle_attack(event)
-                        sounds.play("attack_swing")
+                        handle_attack_action()
 
-                        # ── Spawn a projectile for the shuriken, or a visual
-                        #    flash for all other weapons (including laser beam) ──
-                        if player.attacking:
-                            if player.is_ranged_weapon():
-                                # Ninja only — throw a shuriken in the facing direction.
-                                # Turn facing direction into a velocity vector.
-                                facing_vectors = {
-                                    "right": (1, 0), "left": (-1, 0),
-                                    "down":  (0, 1), "up":   (0, -1),
-                                }
-                                fdx, fdy = facing_vectors.get(player.facing, (1, 0))
-                                speed = Projectile.SHURIKEN_SPEED
-                                px = player.x + player.sprite_width  // 2 - Projectile.SHURIKEN_SIZE // 2
-                                py = player.y + player.sprite_height // 2 - Projectile.SHURIKEN_SIZE // 2
-                                proj = Projectile(px, py, fdx * speed, fdy * speed,
-                                                  "shuriken", player.get_attack_damage())
-                                projectile_list.append(proj)
-                            else:
-                                # Melee or laser beam — flash the attack zone on screen.
-                                # For the laser, get_attack_zones() returns a long thin rect
-                                # that stretches 400 px in the facing direction.
-                                zones = player.get_attack_zones()
-                                if zones:
-                                    attack_effects.append(AttackEffect(zones, player.weapon_type))
+                # Tap support for overlays and pause actions.
+                if event.type in (pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN):
+                    pointer_pos = get_pointer_pos(event)
+                    if pointer_pos is None:
+                        continue
+
+                    if level_up_active:
+                        for stat_id, rect in get_level_up_touch_targets(player, level_up_fonts):
+                            if rect.collidepoint(pointer_pos):
+                                player.apply_level_up(stat_id)
+                                level_up_active = False
+                                break
+                    elif game_paused:
+                        targets = get_pause_touch_targets()
+                        if targets["resume"].collidepoint(pointer_pos):
+                            game_paused = False
+                        elif targets["audio"].collidepoint(pointer_pos):
+                            audio_enabled = not audio_enabled
+                            sounds.set_enabled(audio_enabled)
+                        elif targets["menu"].collidepoint(pointer_pos):
+                            game_running = False
+                    elif voltrak_defeated or game_over_lives:
+                        if get_end_screen_return_rect().collidepoint(pointer_pos):
+                            game_running = False
+                    elif portal_overlay_active:
+                        portal_overlay_active = False
 
             # ── Update ─────────────────────────────────────
             # Only update when not paused AND not showing the level-up screen
+
+            # Dispatch virtual touch buttons (edge-triggered actions).
+            if touch_controls.pause_tapped:
+                if game_paused:
+                    game_paused = False
+                elif not level_up_active and not voltrak_defeated and not game_over_lives:
+                    game_paused = True
+            if touch_controls.interact_tapped:
+                if not game_paused and not level_up_active and not portal_overlay_active:
+                    handle_interact_action()
+            if touch_controls.attack_tapped:
+                if not game_paused and not level_up_active and not portal_overlay_active \
+                        and not voltrak_defeated and not game_over_lives:
+                    handle_attack_action()
 
             if not game_paused and not level_up_active and not voltrak_defeated and not game_over_lives:
 
@@ -1167,7 +1533,7 @@ async def main():
 
                     # Move the player
                     keys_pressed = pygame.key.get_pressed()
-                    player.handle_input(keys_pressed)
+                    player.handle_input(keys_pressed, touch_controls.get_player_input())
                     player.keep_on_screen(SCREEN_WIDTH, SCREEN_HEIGHT)
 
                     # ── Footstep sounds ─────────────────────────────────────
@@ -1572,6 +1938,12 @@ async def main():
 
             # 14. ESC hint in the bottom-right corner
             draw_esc_hint(screen, hint_font)
+
+            # 14b. On-screen touch controls for mobile play (hidden on blocking overlays)
+            if (not game_paused and not level_up_active and not voltrak_defeated
+                    and not game_over_lives and not player.is_dead_flag
+                    and not portal_overlay_active):
+                touch_controls.draw(screen)
 
             # 15. Pause overlay (on top of the game)
             if game_paused:
