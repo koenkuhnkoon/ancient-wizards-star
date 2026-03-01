@@ -3,7 +3,7 @@
 A father-and-son open-world RPG built with Python + Pygame.
 
 ## Team
-Built by a dad and his 8-year-old son. Keep code readable,
+Built by a dad (Koen) and his 8-year-old son (Luca). Keep code readable,
 well-commented, and fun to work on together.
 
 ## Tech Stack
@@ -24,14 +24,21 @@ well-commented, and fun to work on together.
 1. Explore the open world
 2. Fight monsters → collect magical shards, weapons, armor
 3. Level up → increase health and energy (start: Health 10 / Energy 10)
-4. Find and defeat 3 bosses, each with:
-   - 2 enemy mini-bosses to beat first
+4. Find and defeat 1 boss, with:
+   - 2 enemy helper-bosses to beat first
    - 2 player companions fighting alongside you
 5. Light the Ancient Dimensional Portal Gate
-6. Defeat the final big boss → complete Loop 1!
+6. Defeat the final big boss → complete Loop 1! 
 
 ### Characters
-Wizards, knights, assassins, miners, ninjas, robots, monsters
+- Wizards, knights, assassins, miners, ninjas, robots
+- At the beginning of the game, select your character and attributes
+- Monsters: evil ninjas, sewage creatures, zombies, land octopus, little devils, skeletons, poisonous mushrooms, stonehead turtles
+- The boss of loop 1 is a ninja land-eel that makes electric shocks out of its sword
+
+
+### Design elements
+- Inspired by 'brawl stars'
 
 ### Mechanics
 - Walk or run through the open world
@@ -68,6 +75,7 @@ Bakuriani Game/
 ## Coding Style
 - Short, clearly named functions
 - Comments explaining what AND why — an 8-year-old may be reading this!
+- Troubleshoot and learn as you go along, keep editing claude.md as you learn
 - No cryptic variable names (no single letters except loop counters like `i`)
 - Pygame coordinate system: (0,0) is top-left corner
 - Target 60 FPS

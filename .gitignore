@@ -18,3 +18,10 @@ dist/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Agent draft outputs (review before committing)
+agents/output/*
+!agents/output/.gitkeep
+
+# API key
+.env

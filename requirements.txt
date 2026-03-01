@@ -1,2 +1,4 @@
 pygame
 pygbag
+anthropic
+python-dotenv
