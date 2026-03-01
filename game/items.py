@@ -218,8 +218,8 @@ class MagicalShard(Item):
             self.frame_index = (self.frame_index + 1) % len(self.frames)
 
     def _on_collected(self, player):
-        """Picking up a shard gives the player a little energy back!"""
-        player.restore_energy(1)
+        """Picking up a shard adds to the shard total — and might trigger a level-up!"""
+        player.collect_shard()   # Let the Player track the count and check for level-ups
 
     def draw(self, screen):
         """Draw the current spin frame, shifted up or down by the float animation."""
@@ -264,6 +264,47 @@ class HealthPotion(Item):
 
     def draw(self, screen):
         """Draw the potion, shifted up or down by the float animation."""
+        if self.collected:
+            return
+        draw_y = self.y + int(self.float_offset)
+        screen.blit(self.sprite, (self.x, draw_y))
+
+
+# ---------------------------------------------------------------------------
+# PortalKey — dropped when both mini-bosses are defeated, opens the portal gate
+# ---------------------------------------------------------------------------
+
+class PortalKey(Item):
+    """The Portal Key — a special item dropped when BOTH mini-bosses are defeated!
+
+    Pick it up, then walk to the portal gate to open it and face the final boss.
+    It glows golden so you know it's super important!
+
+    Sprite file: item_portal_key.png — 20 x 20 px
+    Fallback color: shiny gold if the art file isn't ready yet
+    """
+
+    def __init__(self, x, y):
+        super().__init__(x, y)
+
+        # Load the key sprite — gold colored placeholder if the file is missing
+        self.sprite = _load_static_sprite(
+            "item_portal_key.png",
+            width=20,
+            height=20,
+            fallback_color=(245, 200, 66),   # Hero gold — shiny!
+        )
+
+    def _get_center(self):
+        """Centre of a 20x20 key sprite."""
+        return (self.x + 10, self.y + 10)
+
+    def _on_collected(self, player):
+        """The player picks up the Portal Key! Mark it on the player object."""
+        player.has_portal_key = True   # main.py checks this flag near the portal
+
+    def draw(self, screen):
+        """Draw the key, shifted up or down by the float animation."""
         if self.collected:
             return
         draw_y = self.y + int(self.float_offset)

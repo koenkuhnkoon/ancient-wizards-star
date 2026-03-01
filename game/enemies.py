@@ -28,6 +28,11 @@ ATTACK_COOLDOWN = 90     # Frames between enemy attacks (90 frames = 1.5 seconds
 WANDER_CHANGE_TICKS = 150  # How often (in frames) an enemy picks a new wander direction
 RESPAWN_TICKS = 600      # Frames before a dead enemy respawns at its start point (10 seconds)
 
+# Chance that a defeated enemy drops a magical shard.
+# 0.60 = 60% chance. random.random() gives a number between 0.0 and 1.0,
+# so "< SHARD_DROP_CHANCE" is True 60% of the time.
+SHARD_DROP_CHANCE = 0.60
+
 # Enemy states — tracks what the enemy is doing right now
 STATE_WANDER = "wander"  # Slowly walking around
 STATE_CHASE  = "chase"   # Running toward the player!
@@ -295,14 +300,17 @@ class Enemy:
             self._die()
 
     def _die(self):
-        """The enemy has been defeated! Switch to the dead state and signal a shard drop.
+        """The enemy has been defeated! Switch to the dead state and maybe signal a shard drop.
 
-        Setting just_died = True tells main.py to create a magical shard pickup
-        at this enemy's position — that's the reward for beating it!
+        There's a 60% chance (SHARD_DROP_CHANCE) that a defeated enemy drops a shard.
+        just_died = True signals main.py to create a shard at this position.
+        just_died = False means no shard this time — the enemy was defeated but dropped nothing.
         """
         self.state = STATE_DEAD
-        self.respawn_ticks = 0   # Start the respawn countdown from zero
-        self.just_died = True    # Signal to main.py: drop a shard here!
+        self.respawn_ticks = 0
+        # random.random() gives a random number between 0.0 and 1.0 each time.
+        # If it's less than 0.60, we drop a shard — so 60% of the time we do!
+        self.just_died = random.random() < SHARD_DROP_CHANCE
 
     def _respawn(self):
         """Bring the enemy back to life at its original starting position.
@@ -432,6 +440,79 @@ class Zombie(Enemy):
             speed=1,            # Slow — only 1 pixel per frame when chasing
             sprite_width=44,
             sprite_height=48,
+            sprite=sprite,
+        )
+
+
+# ------------------------------------------------------------
+# MINI-BOSS BASE CLASS — tougher enemies that don't respawn!
+# ------------------------------------------------------------
+
+class MiniBoss(Enemy):
+    """The base class for mini-boss enemies.
+
+    Mini-bosses are much tougher than regular enemies and they do NOT respawn
+    once defeated. You only have to beat them once — then they're gone for good!
+
+    Luca, mini-bosses are the big challenge enemies before the final boss!
+    """
+
+    def __init__(self, spawn_x, spawn_y, health, speed, sprite_width, sprite_height, sprite):
+        """Set up a mini-boss — same as a regular enemy, but permanent."""
+        super().__init__(spawn_x, spawn_y, health, speed, sprite_width, sprite_height, sprite)
+
+    def _respawn(self):
+        """Mini-bosses NEVER come back after being defeated — this does nothing on purpose!"""
+        pass   # Override the parent's respawn so they stay dead forever
+
+    def is_permanently_dead(self):
+        """Return True if this mini-boss has been beaten and won't come back."""
+        return self.state == STATE_DEAD
+
+
+class Grimrak(MiniBoss):
+    """Grimrak the Stone Golem — the FIRST mini-boss!
+
+    He's big, slow, and very tough. You'll need many hits to defeat him.
+    Spawns when you collect 25 magical shards!
+
+    Sprite file: assets/enemy_grimrak.png — 80 x 80 px
+    Fallback color: dark grey (like a stone golem!)
+    """
+
+    def __init__(self, spawn_x, spawn_y):
+        """Create Grimrak at the given position."""
+        sprite = _load_sprite("enemy_grimrak.png", 80, 80, (80, 80, 80))
+        super().__init__(
+            spawn_x, spawn_y,
+            health=20,          # Very tough — needs LOTS of hits!
+            speed=1,            # Slow and heavy like a boulder
+            sprite_width=80,
+            sprite_height=80,
+            sprite=sprite,
+        )
+
+
+class Zara(MiniBoss):
+    """Zara the Storm Witch — the SECOND mini-boss!
+
+    She's faster than Grimrak but has less health. The story says she switches
+    sides when defeated and joins your team — but that feature is coming later!
+    Spawns when you collect 50 magical shards total!
+
+    Sprite file: assets/enemy_zara.png — 64 x 64 px
+    Fallback color: electric purple (she controls lightning!)
+    """
+
+    def __init__(self, spawn_x, spawn_y):
+        """Create Zara at the given position."""
+        sprite = _load_sprite("enemy_zara.png", 64, 64, (130, 0, 200))
+        super().__init__(
+            spawn_x, spawn_y,
+            health=15,          # Tough, but not as tough as Grimrak
+            speed=2,            # Faster than the golem — she floats!
+            sprite_width=64,
+            sprite_height=64,
             sprite=sprite,
         )
 
