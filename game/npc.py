@@ -26,6 +26,12 @@ COMPANION_FOLLOW_DISTANCE = 80   # pixels
 # How fast a companion moves when it's chasing the player
 COMPANION_SPEED = 3              # pixels per frame
 
+# CompanionFighter combat constants
+FIGHTER_SPEED        = 3
+FIGHTER_ATTACK_RANGE = 45
+FIGHTER_DAMAGE       = 2
+FIGHTER_COOLDOWN     = 90
+
 # How close the player must be to a villager to trigger their hint bubble
 DIALOGUE_TRIGGER_RANGE = 80     # pixels
 
@@ -247,6 +253,52 @@ class Villager(NPC):
         screen.blit(text_surface, (bubble_x + BUBBLE_PADDING, bubble_y + BUBBLE_PADDING))
 
 
+class SummonerNPC(Villager):
+    """A friendly wizard who summons companion fighters for the player.
+
+    Phase 1: can summon 1 CompanionFighter (during mini-boss phase).
+    Phase 2: unlocked after both mini-bosses are defeated — can summon a
+             second fighter AND pre-activate 2 companions for the Voltrak arena.
+
+    The player interacts by walking close and pressing E.
+    main.py calls on_interact() when E is pressed.
+    """
+
+    def __init__(self, x, y):
+        super().__init__(x, y, "Press [E] to summon a companion fighter!")
+        self.sprite = _load_sprite("npc_summoner.png", 44, 44, (200, 160, 0))
+        self.sprite_width = self.sprite.get_width()
+        self.sprite_height = self.sprite.get_height()
+        self.phase                  = 1      # 1 = mini-boss phase, 2 = both beaten
+        self.companions_summoned    = 0
+        self.pre_activated_voltrak  = False
+
+    def notify_bosses_beaten(self):
+        """Call from main.py when both mini-bosses are defeated."""
+        self.phase     = 2
+        self.hint_text = "Two heroes will fight with you through the portal! Press [E] to activate."
+
+    def can_summon(self):
+        return self.companions_summoned < self.phase
+
+    def on_interact(self):
+        """Called by main.py when the player presses E nearby.
+
+        Returns:
+            "summon"       — spawn a CompanionFighter at the player's position
+            "pre_activate" — store that 2 companions will enter the portal
+            None           — nothing to do right now
+        """
+        if self.phase == 2 and not self.pre_activated_voltrak:
+            self.pre_activated_voltrak = True
+            self.hint_text = "Two companions await you through the portal — go!"
+            return "pre_activate"
+        if self.can_summon():
+            self.companions_summoned += 1
+            return "summon"
+        return None
+
+
 # ------------------------------------------------------------------
 # CompanionKnight — a brave fighter who follows the player
 # ------------------------------------------------------------------
@@ -349,6 +401,67 @@ class CompanionWizard(NPC):
         super().draw(screen)
 
 
+class CompanionFighter(NPC):
+    """A summoned companion who actively attacks enemies!
+
+    Unlike CompanionKnight/CompanionWizard who just follow the player,
+    CompanionFighter finds the nearest alive enemy and fights it.
+    Falls back to following the player when no enemies are nearby.
+    """
+
+    def __init__(self, x, y):
+        sprite = _load_sprite("npc_companion_knight.png", 48, 48, (255, 200, 50))
+        super().__init__(x, y, sprite)
+        self.attack_cooldown = 0
+
+    def update(self, player, enemy_list, boss_list):
+        """Find the nearest alive enemy or boss and attack or chase it."""
+        targets = [enemy for enemy in enemy_list if not enemy.is_dead()]
+        targets += [boss for boss in boss_list if not boss.is_permanently_dead()]
+
+        if not targets:
+            self._follow(player)
+        else:
+            my_cx, my_cy = self.get_center()
+            nearest = min(
+                targets,
+                key=lambda target: math.hypot(
+                    target.x + target.sprite_width // 2 - my_cx,
+                    target.y + target.sprite_height // 2 - my_cy,
+                ),
+            )
+            distance_to_target = math.hypot(
+                nearest.x + nearest.sprite_width // 2 - my_cx,
+                nearest.y + nearest.sprite_height // 2 - my_cy,
+            )
+
+            if distance_to_target <= FIGHTER_ATTACK_RANGE and self.attack_cooldown <= 0:
+                nearest.take_damage(FIGHTER_DAMAGE)
+                self.attack_cooldown = FIGHTER_COOLDOWN
+            elif distance_to_target > FIGHTER_ATTACK_RANGE:
+                target_dx = nearest.x + nearest.sprite_width // 2 - my_cx
+                target_dy = nearest.y + nearest.sprite_height // 2 - my_cy
+                target_dist = math.hypot(target_dx, target_dy) or 1
+                self.x += int(target_dx / target_dist * FIGHTER_SPEED)
+                self.y += int(target_dy / target_dist * FIGHTER_SPEED)
+
+        if self.attack_cooldown > 0:
+            self.attack_cooldown -= 1
+
+        # Keep inside screen
+        self.x = max(0, min(self.x, 1280 - self.sprite_width))
+        self.y = max(0, min(self.y, 704  - self.sprite_height))
+
+    def _follow(self, player):
+        distance_to_player = self._distance_to_player(player)
+        if distance_to_player > 80:
+            player_x, player_y = player.x + 24, player.y + 24
+            center_x, center_y = self.get_center()
+            dist = distance_to_player or 1
+            self.x += int((player_x - center_x) / dist * FIGHTER_SPEED)
+            self.y += int((player_y - center_y) / dist * FIGHTER_SPEED)
+
+
 # ------------------------------------------------------------------
 # create_npc_group() — factory function to build all NPCs at once
 # ------------------------------------------------------------------
@@ -356,11 +469,9 @@ class CompanionWizard(NPC):
 def create_npc_group():
     """Create all the NPCs that live in the world of Lumoria.
 
-    Spawn positions come from NPC_SPAWN_POINTS in game/world.py:
-      companion_knight → (700, 370)
-      companion_wizard → (580, 370)
-      villager_1       → (200, 310)
-      villager_2       → (600, 200)
+    Spawn positions come from NPC_SPAWN_POINTS in game/world.py.
+    Companions are NOT auto-spawned at game start anymore; they are
+    summoned during boss phases via the Summoner NPC.
 
     The player starts near the screen centre (640, 360), so the
     companions start just to the right and left of the player.
@@ -371,11 +482,6 @@ def create_npc_group():
         villagers  — list: [Villager, Villager]
                      These stand still and share hints when you walk near.
     """
-
-    # --- Companions ---
-    # They start near the player's starting position so they feel nearby right away
-    companion_knight = CompanionKnight(700, 370)   # just to the right of the player
-    companion_wizard = CompanionWizard(580, 370)   # just to the left of the player
 
     # --- Villagers ---
     # Scattered around the world — each gives a different useful tip!
@@ -388,7 +494,9 @@ def create_npc_group():
         "The Ancient Wizard's Star smells like fresh rain. Please save it!",
     )
 
-    companions = [companion_knight, companion_wizard]
+    summoner = SummonerNPC(640, 500)
+
+    companions = []   # Start empty — companions only appear when summoned.
     villagers  = [villager_1, villager_2]
 
-    return companions, villagers
+    return companions, villagers, summoner

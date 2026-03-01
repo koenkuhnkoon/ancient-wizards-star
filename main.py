@@ -13,17 +13,20 @@ import pygame
 # ATTACK_DAMAGE is gone — damage is now calculated inside player.get_attack_damage()!
 from game.player import Player
 
+# Sound manager — handles all music and sound effects
+from game.sound import SoundManager
+
 # Import the World class, and the lists of where shards and potions start
-from game.world   import World, SHARD_POSITIONS, HEALTH_POTION_POSITIONS
+from game.world   import World, VoltrakArena, SHARD_POSITIONS, HEALTH_POTION_POSITIONS, PORTAL_X, PORTAL_Y
 
 # Import the function that creates all the enemies, plus the two mini-boss classes
-from game.enemies import create_enemy_group, Grimrak, Zara
+from game.enemies import create_enemy_group, Grimrak, Zara, Voltrak
 
 # Import the function that creates all the friendly NPCs (companions + villagers)
-from game.npc     import create_npc_group
+from game.npc     import create_npc_group, CompanionFighter
 
 # Import items — factory function plus all item types we use directly
-from game.items   import create_items_group, HealthPotion, MagicalShard, PortalKey
+from game.items   import create_items_group, HealthPotion, BigHealthPotion, MagicalShard, PortalKey
 
 # ── Screen & Game Constants ────────────────────────────────
 
@@ -52,18 +55,18 @@ ENDURANCE_BAR_HEIGHT =  16
 # Strength bar — shorter secondary stat bar shown below endurance
 STRENGTH_BAR_X      =  12
 STRENGTH_BAR_Y      =  56
-STRENGTH_BAR_WIDTH  =  80
-STRENGTH_BAR_HEIGHT =  10
+STRENGTH_BAR_WIDTH  = 120    # Same as HP and endurance bars
+STRENGTH_BAR_HEIGHT =  16    # Same as HP and endurance bars
 
 # Magic bar — sits just below the strength bar
 MAGIC_BAR_X      =  12
-MAGIC_BAR_Y      =  70
-MAGIC_BAR_WIDTH  =  80
-MAGIC_BAR_HEIGHT =  10
+MAGIC_BAR_Y      =  78      # 56 + 16 (height) + 6 (gap) = 78
+MAGIC_BAR_WIDTH  = 120      # Same as HP and endurance bars
+MAGIC_BAR_HEIGHT =  16      # Same as HP and endurance bars
 
 # Portrait — shifted down to make room for the new stat bars
 PORTRAIT_X    =  12
-PORTRAIT_Y    =  84   # Was 60, now 84 to clear the strength and magic bars
+PORTRAIT_Y    = 100         # Was 84, now 100 to clear the strength and magic bars
 PORTRAIT_SIZE =  48
 
 HUD_LABEL_GAP_X   =   6
@@ -137,6 +140,19 @@ ZARA_SPAWN_POS    = (950, 400)
 # Where the portal key drops when both mini-bosses are beaten
 PORTAL_KEY_DROP_POS = (640, 300)
 
+# Where Voltrak spawns when the portal is opened (just left of the gate)
+VOLTRAK_SPAWN_POS = (880, 270)
+
+# ── Voltrak Boss Health Bar ─────────────────────────────────
+# A wide bar shown at the top-centre of the screen during the final fight.
+# It tells the player how close they are to saving Lumoria!
+VOLTRAK_BAR_WIDTH      = 500
+VOLTRAK_BAR_HEIGHT     = 24
+VOLTRAK_BAR_X          = SCREEN_WIDTH  // 2 - VOLTRAK_BAR_WIDTH  // 2
+VOLTRAK_BAR_Y          = 18
+VOLTRAK_BAR_FILL_COLOR = (0, 220, 255)   # Electric cyan — Voltrak's theme!
+VOLTRAK_BAR_BG_COLOR   = (0, 40, 60)    # Dark teal background
+
 # ── Respawn Points ─────────────────────────────────────────
 # When the player dies, they come back at the first respawn point.
 # (We'll add logic to pick the nearest one later!)
@@ -145,6 +161,287 @@ RESPAWN_POINTS = [
     (200, 300),   # Near the first villager
     (850, 450),   # Right side of the map
 ]
+
+# Total lives before the run ends in game over.
+MAX_LIVES = 3
+
+
+# ============================================================
+# PROJECTILE CLASS — flying weapons!
+#
+# When the Ninja throws a shuriken or the Robot fires a laser,
+# a Projectile is created here. It flies across the screen and
+# damages whatever enemy it hits first.
+# ============================================================
+
+class Projectile:
+    """A flying weapon shot by the Ninja (shuriken) or Robot (laser).
+
+    It moves across the screen until it hits an enemy or travels too far.
+    dx, dy -- direction of travel (normalised to speed pixels per frame)
+    weapon  -- "shuriken" or "laser" — affects size, colour, and damage
+    """
+    SHURIKEN_SPEED  = 8    # pixels per frame
+    LASER_SPEED     = 12   # lasers are faster!
+    SHURIKEN_SIZE   = 14   # pixel width and height of the shuriken
+    LASER_W, LASER_H = 24, 8   # laser beam rectangle
+
+    SHURIKEN_COLOR = (200, 220, 255)   # silver-blue fallback
+    LASER_COLOR    = (0, 230, 255)     # bright cyan fallback
+
+    MAX_TRAVEL = 600   # despawn after travelling this many pixels
+
+    # Sprite frames — loaded once by Projectile.load_sprites() after pygame.init()
+    _shuriken_frames: list = []   # 4 spinning frames from fx_projectile_shuriken.png
+    _laser_frames: list    = []   # 2 frames from fx_projectile_laser.png
+
+    @classmethod
+    def load_sprites(cls):
+        """Load projectile sprite sheets from disk.
+
+        Called once in main() after pygame.display.set_mode() so
+        convert_alpha() works correctly.
+        """
+        def _slice(path, fw, fh, n):
+            try:
+                sheet = pygame.image.load(path).convert_alpha()
+                return [sheet.subsurface(pygame.Rect(i * fw, 0, fw, fh)) for i in range(n)]
+            except Exception:
+                return []   # Fall back to coloured rect if file is missing
+
+        cls._shuriken_frames = _slice(
+            "assets/fx_projectile_shuriken.png", cls.SHURIKEN_SIZE, cls.SHURIKEN_SIZE, 4)
+        cls._laser_frames = _slice(
+            "assets/fx_projectile_laser.png", cls.LASER_W, cls.LASER_H, 2)
+
+    def __init__(self, x, y, dx, dy, weapon, damage):
+        self.x       = float(x)
+        self.y       = float(y)
+        self.dx      = dx   # velocity x (pixels/frame)
+        self.dy      = dy   # velocity y (pixels/frame)
+        self.weapon  = weapon
+        self.damage  = damage
+        self.alive   = True
+        self.travelled = 0.0   # total distance moved so far
+
+    def update(self):
+        """Move the projectile one frame. Return False when it should be removed."""
+        if not self.alive:
+            return False
+        self.x  += self.dx
+        self.y  += self.dy
+        step = (self.dx ** 2 + self.dy ** 2) ** 0.5
+        self.travelled += step
+        if self.travelled >= self.MAX_TRAVEL:
+            self.alive = False
+        return self.alive
+
+    def get_rect(self):
+        """The collision rectangle of this projectile."""
+        if self.weapon == "shuriken":
+            return pygame.Rect(int(self.x), int(self.y),
+                               self.SHURIKEN_SIZE, self.SHURIKEN_SIZE)
+        else:   # laser
+            return pygame.Rect(int(self.x), int(self.y),
+                               self.LASER_W, self.LASER_H)
+
+    def draw(self, screen):
+        """Draw the projectile using its sprite sheet, or a coloured rectangle as fallback."""
+        if not self.alive:
+            return
+        rect = self.get_rect()
+        frames = self._shuriken_frames if self.weapon == "shuriken" else self._laser_frames
+        if frames:
+            # Cycle through frames as the projectile flies — gives a spinning/pulsing look
+            idx = int(self.travelled / 20) % len(frames)
+            screen.blit(frames[idx], (rect.x, rect.y))
+        else:
+            # Fallback: coloured rectangle if sprites couldn't be loaded
+            color = self.SHURIKEN_COLOR if self.weapon == "shuriken" else self.LASER_COLOR
+            pygame.draw.rect(screen, color, rect)
+            pygame.draw.rect(screen, (255, 255, 255), rect, 1)
+
+
+# ============================================================
+# ATTACK EFFECT CLASS — brief flash when a melee weapon swings
+#
+# When the player hits Space with a sword, pickaxe, etc., a
+# coloured flash appears showing EXACTLY where the weapon hit.
+# It fades out after about 0.2 seconds (12 frames at 60 FPS).
+# ============================================================
+
+class AttackEffect:
+    """A brief visual flash showing the area of a melee attack.
+
+    Drawn using the fx_attack_*.png sprite sheets for EFFECT_DURATION frames,
+    then it disappears automatically.
+    Falls back to a coloured rectangle if the art file isn't loaded yet.
+    """
+    EFFECT_DURATION = 12   # frames (0.2 seconds at 60 FPS) — default for all weapons
+
+    # Some weapons linger longer — or shorter — than the default 12 frames
+    WEAPON_DURATIONS = {
+        "laser":       44,   # 0.73 s — the beam hangs in the air a good moment
+        "enemy_melee":  8,   # 0.13 s — short, sharp red flash when an enemy hits the player
+    }
+
+    # Fallback colours per weapon — used if sprites haven't loaded
+    COLORS = {
+        "staff":       (160,  80, 255, 140),   # purple burst
+        "sword":       (255, 230,  80, 140),   # golden slash
+        "daggers":     (200, 200, 255, 140),   # silver thrust
+        "pickaxe":     (200, 120,  40, 140),   # orange arc
+        "laser":       (  0, 230, 255, 220),   # bright cyan beam
+        "enemy_melee": (255,  50,  50, 180),   # red flash — shown when ANY enemy hits the player
+    }
+
+    # Sprite frames per weapon — filled by load_sprites() after pygame.init()
+    _frames: dict = {}
+
+    @classmethod
+    def load_sprites(cls):
+        """Load all attack effect sprite sheets from disk.
+
+        Each sheet is a horizontal strip of animation frames.
+        Called once in main() after pygame.display.set_mode() so
+        convert_alpha() works correctly.
+        """
+        # weapon → (filepath, frame_width, frame_height, num_frames)
+        specs = {
+            "staff":   ("assets/fx_attack_staff.png",   100, 100, 4),
+            "sword":   ("assets/fx_attack_sword.png",    80,  50, 4),
+            "daggers": ("assets/fx_attack_daggers.png",  40,  32, 2),
+            "pickaxe": ("assets/fx_attack_pickaxe.png", 110,  40, 4),
+        }
+        for weapon, (path, fw, fh, n) in specs.items():
+            try:
+                sheet = pygame.image.load(path).convert_alpha()
+                cls._frames[weapon] = [
+                    sheet.subsurface(pygame.Rect(i * fw, 0, fw, fh))
+                    for i in range(n)
+                ]
+            except Exception:
+                cls._frames[weapon] = []   # Will fall back to coloured rect
+
+    def __init__(self, rects, weapon_type):
+        """rects -- list of pygame.Rect zones to highlight"""
+        self.rects      = rects
+        self.weapon     = weapon_type
+        duration        = self.WEAPON_DURATIONS.get(weapon_type, self.EFFECT_DURATION)
+        self.timer      = duration
+        self.max_timer  = duration   # kept for the fade-out ratio calculation
+        self.alive      = True
+
+    def update(self):
+        """Count down the timer — when it reaches 0, the effect disappears."""
+        self.timer -= 1
+        if self.timer <= 0:
+            self.alive = False
+
+    def draw(self, screen):
+        """Draw the attack effect using its sprite sheet, or a coloured fallback."""
+        if not self.alive:
+            return
+
+        frames = self._frames.get(self.weapon, [])
+        # Fade out over the effect's lifetime (1.0 at start → 0.0 at end)
+        fade = self.timer / self.max_timer
+
+        if frames:
+            num_frames = len(frames)
+            # Play the animation forward: frame 0 at swing start, last frame just before fade
+            idx = min(int((1.0 - fade) * num_frames), num_frames - 1)
+            frame = frames[idx].copy()   # Copy so set_alpha doesn't affect the shared sheet
+            frame.set_alpha(int(255 * fade))
+            for rect in self.rects:
+                fw, fh = frame.get_size()
+                if rect.width != fw or rect.height != fh:
+                    # Facing up/down swaps width/height — rotate the frame to match
+                    if rect.height > rect.width:
+                        blit_frame = pygame.transform.rotate(frame, 90)
+                    else:
+                        blit_frame = pygame.transform.scale(frame, (rect.width, rect.height))
+                else:
+                    blit_frame = frame
+                screen.blit(blit_frame, (rect.x, rect.y))
+        else:
+            # Fallback: semi-transparent coloured rectangle
+            alpha = int(180 * fade)
+            color_base = self.COLORS.get(self.weapon, (255, 255, 255, 140))
+            color = (color_base[0], color_base[1], color_base[2], alpha)
+            surf = pygame.Surface((screen.get_width(), screen.get_height()), pygame.SRCALPHA)
+            for rect in self.rects:
+                pygame.draw.rect(surf, color, rect, border_radius=6)
+            screen.blit(surf, (0, 0))
+
+
+# ── Helper: Draw Voltrak's Boss Health Bar ─────────────────
+
+def draw_voltrak_boss_bar(screen, voltrak, bar_font):
+    """Draw Voltrak's health bar at the top-centre of the screen.
+
+    This big bar tells the player how much health the final boss has left.
+    It only shows while Voltrak is alive and fighting.
+
+    voltrak  -- the Voltrak boss object
+    bar_font -- the font used for the label underneath the bar
+    """
+    # Dark teal background — the "empty" part of the health bar
+    bg_rect = pygame.Rect(VOLTRAK_BAR_X, VOLTRAK_BAR_Y, VOLTRAK_BAR_WIDTH, VOLTRAK_BAR_HEIGHT)
+    pygame.draw.rect(screen, VOLTRAK_BAR_BG_COLOR, bg_rect)
+
+    # Cyan fill — shrinks as Voltrak takes damage
+    fraction = voltrak.health / voltrak.max_health
+    fill_w   = int(VOLTRAK_BAR_WIDTH * fraction)
+    if fill_w > 0:
+        pygame.draw.rect(screen, VOLTRAK_BAR_FILL_COLOR,
+            pygame.Rect(VOLTRAK_BAR_X, VOLTRAK_BAR_Y, fill_w, VOLTRAK_BAR_HEIGHT))
+
+    # Phase 2 tint: overlay orange when Voltrak is in his angry second phase!
+    if voltrak.health <= voltrak.max_health // 2:
+        phase_surf = pygame.Surface((fill_w, VOLTRAK_BAR_HEIGHT), pygame.SRCALPHA)
+        phase_surf.fill((255, 120, 0, 70))   # Orange-tinted, semi-transparent
+        screen.blit(phase_surf, (VOLTRAK_BAR_X, VOLTRAK_BAR_Y))
+
+    # Thin white outline around the bar
+    pygame.draw.rect(screen, (220, 220, 220), bg_rect, width=1)
+
+    # Label underneath the bar
+    label = bar_font.render("VOLTRAK  THE SHOCKBLADE EEL", True, HERO_GOLD)
+    label_x = SCREEN_WIDTH // 2 - label.get_width() // 2
+    screen.blit(label, (label_x, VOLTRAK_BAR_Y + VOLTRAK_BAR_HEIGHT + 3))
+
+
+# ── Helper: Draw the Victory Screen ────────────────────────
+
+def draw_victory_screen(screen, title_font, body_font):
+    """Show the victory overlay when Voltrak is defeated.
+
+    A deep purple overlay with golden text celebrating the win.
+    The player can press ESC to return to the title screen.
+
+    title_font -- big bold font for the main celebration line
+    body_font  -- smaller font for the sub-text and hint
+    """
+    # Dark gold overlay — celebratory and warm
+    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    overlay.fill((120, 80, 0, 180))
+    screen.blit(overlay, (0, 0))
+
+    # Big celebration line
+    title = title_font.render("YOU SAVED LUMORIA!", True, HERO_GOLD)
+    screen.blit(title, (SCREEN_WIDTH // 2 - title.get_width() // 2, SCREEN_HEIGHT // 2 - 90))
+
+    # Story text
+    sub1 = body_font.render("Voltrak the Shockblade Eel has been defeated!", True, (255, 238, 190))
+    screen.blit(sub1, (SCREEN_WIDTH // 2 - sub1.get_width() // 2, SCREEN_HEIGHT // 2 - 30))
+
+    sub2 = body_font.render("The Ancient Wizard's Star shines safely again!", True, (255, 250, 220))
+    screen.blit(sub2, (SCREEN_WIDTH // 2 - sub2.get_width() // 2, SCREEN_HEIGHT // 2 + 14))
+
+    # Hint
+    hint = body_font.render("Press Space to return to the menu", True, (180, 180, 180))
+    screen.blit(hint, (SCREEN_WIDTH // 2 - hint.get_width() // 2, SCREEN_HEIGHT // 2 + 70))
 
 
 # ── Helper: Draw the HUD ───────────────────────────────────
@@ -281,7 +578,7 @@ def draw_level_up_overlay(screen, player, level_up_fonts, level_up_surfaces):
 
 # ── Helper: Draw the Death Screen ─────────────────────────
 
-def draw_death_screen(screen, death_font):
+def draw_death_screen(screen, death_font, lives_remaining):
     """Show a 'You died! Respawning...' message centered on screen.
 
     We draw this ON TOP of the game world so the player can see
@@ -291,6 +588,29 @@ def draw_death_screen(screen, death_font):
     msg_x = SCREEN_WIDTH  // 2 - msg.get_width()  // 2
     msg_y = SCREEN_HEIGHT // 2 - msg.get_height() // 2
     screen.blit(msg, (msg_x, msg_y))
+
+    lives_msg = death_font.render(f"Lives left: {lives_remaining}", True, (245, 200, 66))
+    lives_x = SCREEN_WIDTH // 2 - lives_msg.get_width() // 2
+    screen.blit(lives_msg, (lives_x, msg_y + 42))
+
+
+def draw_game_over_screen(screen, title_font, body_font):
+    """Draw a full game-over overlay after all lives are used."""
+    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    overlay.fill((10, 10, 10, 220))
+    screen.blit(overlay, (0, 0))
+
+    title = title_font.render("GAME OVER", True, (231, 76, 60))
+    title_x = SCREEN_WIDTH // 2 - title.get_width() // 2
+    screen.blit(title, (title_x, SCREEN_HEIGHT // 2 - 85))
+
+    body = body_font.render("You ran out of lives in Lumoria.", True, (230, 230, 230))
+    body_x = SCREEN_WIDTH // 2 - body.get_width() // 2
+    screen.blit(body, (body_x, SCREEN_HEIGHT // 2 - 20))
+
+    hint = body_font.render("Press Space or ESC to return to the menu", True, (180, 180, 180))
+    hint_x = SCREEN_WIDTH // 2 - hint.get_width() // 2
+    screen.blit(hint, (hint_x, SCREEN_HEIGHT // 2 + 30))
 
 
 # ── Helper: Draw the "ESC = Menu" hint ────────────────────
@@ -475,7 +795,18 @@ async def run_character_selection(screen, clock, fonts):
 async def main():
     """Set up pygame and run the game from start to finish."""
 
+    # IMPORTANT: pre_init must come BEFORE pygame.init()!
+    # On Windows, calling mixer.init() AFTER pygame.init() can silently fail,
+    # meaning you'd get no sound and no error message. pre_init reserves the
+    # audio settings first so pygame.init() sets up the mixer correctly.
+    # 44100 Hz = CD-quality sample rate, -16 = 16-bit signed audio,
+    # 2 = stereo (two channels: left + right), 512 = small buffer for low lag.
+    pygame.mixer.pre_init(44100, -16, 2, 512)
+
     pygame.init()
+
+    # ── Set up audio — SoundManager configures channels after pre_init ─────
+    sounds = SoundManager()
 
     # ── Create all fonts HERE, once, right after pygame.init() ────────────
     hud_font  = pygame.font.SysFont("Arial", 11)
@@ -503,11 +834,21 @@ async def main():
     # Font for the big red "You died!" message
     death_font = pygame.font.SysFont("Arial", 36, bold=True)
 
+    # Fonts for the Voltrak boss fight
+    voltrak_bar_font  = pygame.font.SysFont("Arial", 13, bold=True)   # Label under the boss bar
+    victory_title_font = pygame.font.SysFont("Arial", 42, bold=True)  # "VOLTRAK IS DEFEATED!"
+    victory_body_font  = pygame.font.SysFont("Arial", 20)             # Sub-text and hint
+
     npc_font = pygame.font.SysFont("Arial", 14)
 
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     pygame.display.set_caption(GAME_TITLE)
     clock = pygame.time.Clock()
+
+    # ── Load attack and projectile sprite sheets ───────────
+    # Must happen AFTER set_mode() so convert_alpha() works.
+    Projectile.load_sprites()
+    AttackEffect.load_sprites()
 
     # ── Pre-build overlay surfaces ─────────────────────────
     # We build these once so we don't create new surfaces 60 times per second!
@@ -530,6 +871,9 @@ async def main():
 
     while app_running:
 
+        # ── Start menu music ───────────────────────────────
+        sounds.play_menu_music()
+
         # ── Character Selection ────────────────────────────
         chosen_class = await run_character_selection(screen, clock, select_fonts)
         if chosen_class is None:
@@ -548,16 +892,30 @@ async def main():
         # ── Create the World ───────────────────────────────
         world = World()
         enemy_list = create_enemy_group()
-        companions, villagers = create_npc_group()
+        companions, villagers, summoner = create_npc_group()
 
         item_list = create_items_group(SHARD_POSITIONS)
         for pos in HEALTH_POTION_POSITIONS:
             item_list.append(HealthPotion(pos[0], pos[1]))
 
+        # ── Flying projectiles and melee flash effects ─────
+        # projectile_list holds any shurikens or laser blasts currently in the air.
+        # attack_effects holds brief coloured flashes showing where melee weapons hit.
+        projectile_list = []   # Flying shurikens and laser blasts
+        attack_effects  = []   # Brief visual flashes showing melee attack areas
+        enemy_proj_list = []   # Projectiles fired by Zara (and future enemies)
+
+        # ── Switch to exploration music ────────────────────
+        sounds.play_exploration_music()
+
         # ── Pause state ────────────────────────────────────
         game_paused            = False
         audio_enabled          = True
         selected_setting_index = 0
+
+        # ── For hurt-sound detection ───────────────────────
+        # We compare health before/after enemy updates each frame.
+        prev_health = None
 
         # ── Level-up overlay state ─────────────────────────
         level_up_active = False   # True while showing the level-up choice screen
@@ -569,8 +927,21 @@ async def main():
         miniboss_list       = []      # Holds Grimrak and Zara once they're active
         miniboss1_defeated  = False   # True once Grimrak is permanently beaten
         miniboss2_defeated  = False   # True once Zara is permanently beaten
-        portal_key_spawned  = False   # True once we've dropped the key in the world
-        portal_open         = False   # True once the player uses the key at the gate
+        portal_key_spawned    = False   # True once we've dropped the key in the world
+        portal_open           = False   # True once the player uses the key at the gate
+        portal_overlay_active = False   # True while the "portal opened!" splash is visible
+        portal_overlay_timer  = 0       # Countdown — auto-dismisses the splash after 3 seconds
+
+        # Voltrak arena and companions
+        arena_mode         = False   # True once we enter the final arena map
+        voltrak_list       = []      # List containing Voltrak when in arena mode
+        fighter_companions = []      # CompanionFighters summoned by the player
+        voltrak_defeated   = False   # True once Voltrak is beaten — shows victory screen!
+        lives_remaining    = MAX_LIVES
+        game_over_lives    = False   # True after the 3rd death; run is over.
+
+        # Reusable slam warning surface to avoid creating a new one every draw frame.
+        slam_warning_surf = pygame.Surface((130, 130), pygame.SRCALPHA)
 
         # ── Game Loop ──────────────────────────────────────
         game_running = True
@@ -593,12 +964,24 @@ async def main():
                             level_up_active = False
                         # Swallow all other keys — nothing else happens while choosing
 
-                    # ── ESC: return to character selection ──
+                    # ── ESC: check overlays in priority order ──────────────
                     elif event.key == pygame.K_ESCAPE:
-                        if game_paused:
+                        if voltrak_defeated:
+                            game_running = False   # You won! ESC goes back to the title screen
+                        elif game_over_lives:
+                            game_running = False   # Out of lives — back to menu.
+                        elif portal_overlay_active:
+                            portal_overlay_active = False   # Dismiss the intro splash → fight begins!
+                        elif game_paused:
                             game_paused = False
                         else:
                             game_running = False
+
+                    elif event.key == pygame.K_SPACE and voltrak_defeated:
+                        # Let Space return to menu too, matching the victory-screen hint text.
+                        game_running = False
+                    elif event.key == pygame.K_SPACE and game_over_lives:
+                        game_running = False
 
                     # ── P: toggle the pause menu ────────────
                     elif event.key == pygame.K_p:
@@ -613,15 +996,88 @@ async def main():
                         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
                             if selected_setting_index == 0:
                                 audio_enabled = not audio_enabled
+                                sounds.set_enabled(audio_enabled)
+
+                    # ── E: enter the portal — only when close to it AND holding the key ──
+                    elif event.key == pygame.K_e:
+                        # First, try interacting with the Summoner if the player is close.
+                        summoner_rect = pygame.Rect(
+                            summoner.x, summoner.y, summoner.sprite_width, summoner.sprite_height
+                        )
+                        player_rect = pygame.Rect(
+                            player.x, player.y, player.sprite_width, player.sprite_height
+                        )
+                        if summoner_rect.inflate(80, 80).colliderect(player_rect):
+                            summon_result = summoner.on_interact()
+                            if summon_result == "summon":
+                                fighter_companions.append(CompanionFighter(player.x + 20, player.y + 20))
+                            elif summon_result == "pre_activate":
+                                # The flag is stored in the Summoner object and used at portal entry.
+                                pass
+
+                        # The portal gate is 96 px wide and 128 px tall.
+                        # We check if the player is close enough to step through it.
+                        portal_rect = pygame.Rect(PORTAL_X, PORTAL_Y, 96, 128)
+                        near_portal = portal_rect.inflate(40, 40).colliderect(player_rect)
+                        if player.has_portal_key and near_portal and not portal_open:
+                            # Enter Voltrak's arena.
+                            portal_open = True
+                            arena_mode = True
+                            world = VoltrakArena()
+                            player.x, player.y = 600, 330
+                            fighter_companions.clear()
+
+                            # 2 fighters if pre-activated at the Summoner, otherwise 1.
+                            if summoner.pre_activated_voltrak:
+                                fighter_companions.append(CompanionFighter(480, 300))
+                                fighter_companions.append(CompanionFighter(720, 300))
+                            else:
+                                fighter_companions.append(CompanionFighter(560, 300))
+
+                            # Voltrak spawns in the middle of the arena.
+                            if not voltrak_list:
+                                voltrak_list.append(Voltrak(550, 280))
+
+                            # Clear old world entities when entering the final arena.
+                            enemy_list.clear()
+                            miniboss_list.clear()
+                            item_list.clear()
+                            enemy_proj_list.clear()
 
                     # ── Space: attack — only when playing normally ──
                     elif event.key == pygame.K_SPACE:
                         player.handle_attack(event)
+                        sounds.play("attack_swing")
+
+                        # ── Spawn a projectile for the shuriken, or a visual
+                        #    flash for all other weapons (including laser beam) ──
+                        if player.attacking:
+                            if player.is_ranged_weapon():
+                                # Ninja only — throw a shuriken in the facing direction.
+                                # Turn facing direction into a velocity vector.
+                                facing_vectors = {
+                                    "right": (1, 0), "left": (-1, 0),
+                                    "down":  (0, 1), "up":   (0, -1),
+                                }
+                                fdx, fdy = facing_vectors.get(player.facing, (1, 0))
+                                speed = Projectile.SHURIKEN_SPEED
+                                px = player.x + player.sprite_width  // 2 - Projectile.SHURIKEN_SIZE // 2
+                                py = player.y + player.sprite_height // 2 - Projectile.SHURIKEN_SIZE // 2
+                                proj = Projectile(px, py, fdx * speed, fdy * speed,
+                                                  "shuriken", player.get_attack_damage())
+                                projectile_list.append(proj)
+                            else:
+                                # Melee or laser beam — flash the attack zone on screen.
+                                # For the laser, get_attack_zones() returns a long thin rect
+                                # that stretches 400 px in the facing direction.
+                                zones = player.get_attack_zones()
+                                if zones:
+                                    attack_effects.append(AttackEffect(zones, player.weapon_type))
 
             # ── Update ─────────────────────────────────────
             # Only update when not paused AND not showing the level-up screen
 
-            if not game_paused and not level_up_active:
+            if not game_paused and not level_up_active and not voltrak_defeated and not game_over_lives:
 
                 # ── Handle player death state first ────────
                 # While the player is dead, we count down the timer and skip
@@ -629,59 +1085,207 @@ async def main():
                 if player.is_dead_flag:
                     ready_to_respawn = player.update_death_timer()
                     if ready_to_respawn:
-                        # Respawn at the first respawn point (could be smarter later!)
-                        rx, ry = RESPAWN_POINTS[0]
-                        player.respawn(rx, ry)
+                        if lives_remaining > 0:
+                            # Respawn at the first respawn point (could be smarter later!)
+                            rx, ry = RESPAWN_POINTS[0]
+                            player.respawn(rx, ry)
+                            sounds.play("respawn")
+                            sounds.play_exploration_music()
+                        else:
+                            # No lives left — lock into game-over state.
+                            game_over_lives = True
 
                 else:
-                    # ── Check attack hits FIRST, before handle_input resets the flag ──
+                    # ── Check melee attack hits FIRST, before handle_input resets the flag ──
                     # WHY first? handle_attack() sets player.attacking = True in the event
                     # loop above. But handle_input() resets it to False at its very start.
                     # If we called handle_input() before this check, attacking would always be
                     # False here and enemies would NEVER take damage!
-                    if player.attacking:
-                        attack_rect = player.get_attack_rect()
-                        attack_dmg  = player.get_attack_damage()   # Weapon + stat-based damage
+                    #
+                    # Melee only — ranged weapons use the projectile_list below!
+                    if player.attacking and not player.is_ranged_weapon():
+                        attack_zones = player.get_attack_zones()
 
-                        # Check all normal enemies
-                        for enemy in enemy_list:
-                            if not enemy.is_dead():
-                                enemy_rect = pygame.Rect(enemy.x, enemy.y,
-                                                         enemy.sprite_width, enemy.sprite_height)
-                                if attack_rect.colliderect(enemy_rect):
-                                    enemy.take_damage(attack_dmg)
+                        for zone in attack_zones:
+                            # Check all normal enemies
+                            for enemy in enemy_list:
+                                if not enemy.is_dead():
+                                    enemy_rect = pygame.Rect(enemy.x, enemy.y,
+                                                             enemy.sprite_width, enemy.sprite_height)
+                                    if zone.colliderect(enemy_rect) and not enemy._already_hit_this_swing:
+                                        # Assassin uses special one-shot damage;
+                                        # all other classes use the normal formula
+                                        if player.weapon_type == "daggers":
+                                            dmg = player.get_assassin_damage(enemy.max_health, False)
+                                        else:
+                                            dmg = player.get_attack_damage()
+                                        enemy.take_damage(dmg)
+                                        enemy._already_hit_this_swing = True
+                                        sounds.play("attack_hit")
+                                        # Check for drops RIGHT NOW before update() resets these flags!
+                                        if enemy.just_died:
+                                            item_list.append(MagicalShard(enemy.x, enemy.y))
+                                        if enemy.potion_drop:
+                                            item_list.append(HealthPotion(enemy.x, enemy.y))
 
-                        # Check all mini-bosses (Grimrak, Zara) — same damage formula
-                        for boss in miniboss_list:
-                            if not boss.is_permanently_dead():
-                                boss_rect = pygame.Rect(boss.x, boss.y,
-                                                        boss.sprite_width, boss.sprite_height)
-                                if attack_rect.colliderect(boss_rect):
-                                    boss.take_damage(attack_dmg)
+                            # Check all mini-bosses (Grimrak, Zara) — same zone check
+                            for boss in miniboss_list:
+                                if not boss.is_permanently_dead():
+                                    boss_rect = pygame.Rect(boss.x, boss.y,
+                                                            boss.sprite_width, boss.sprite_height)
+                                    if zone.colliderect(boss_rect):
+                                        # Assassin daggers still do special damage on bosses!
+                                        if player.weapon_type == "daggers":
+                                            dmg = player.get_assassin_damage(boss.max_health, True)
+                                        else:
+                                            dmg = player.get_attack_damage()
+                                        boss.take_damage(dmg)
+                                        sounds.play("attack_hit")
+                                        # Mini-bosses always drop a shard AND a big golden potion!
+                                        # Check RIGHT NOW before boss.update() resets these flags.
+                                        if boss.just_died:
+                                            item_list.append(MagicalShard(boss.x, boss.y))
+                                        if boss.boss_potion_drop:
+                                            item_list.append(BigHealthPotion(boss.x, boss.y))
+
+                            # Check Voltrak — the final boss takes melee damage too!
+                            for voltrak in voltrak_list:
+                                if voltrak.is_permanently_dead():
+                                    continue
+                                voltrak_rect = pygame.Rect(voltrak.x, voltrak.y,
+                                                           voltrak.sprite_width, voltrak.sprite_height)
+                                if zone.colliderect(voltrak_rect):
+                                    if player.weapon_type == "daggers":
+                                        dmg = player.get_assassin_damage(voltrak.max_health, True)
+                                    else:
+                                        dmg = player.get_attack_damage()
+                                    voltrak.take_damage(dmg)
+                                    sounds.play("attack_hit")
+                                    # Did that hit defeat Voltrak? Check now — before update() resets the flag!
+                                    if voltrak.just_died:
+                                        voltrak_defeated = True
 
                     # Move the player
                     keys_pressed = pygame.key.get_pressed()
                     player.handle_input(keys_pressed)
                     player.keep_on_screen(SCREEN_WIDTH, SCREEN_HEIGHT)
 
+                    # ── Footstep sounds ─────────────────────────────────────
+                    # Play a step sound while the player is moving. We check
+                    # which animation is playing to know if they're walking or running.
+                    if player.current_animation in ("walk", "run"):
+                        sounds.play_footstep(running=player.current_animation == "run")
+                    else:
+                        sounds.reset_footstep()
+
                     # Did the player just run out of health from enemy contact?
                     if not player.is_alive():
                         player.trigger_death()
+                        lives_remaining = max(0, lives_remaining - 1)
+                        if lives_remaining <= 0:
+                            game_over_lives = True
+                        sounds.play("player_die")   # Short death stinger — plays right away
+                        sounds.play_game_over()     # Stop music and play game-over track
+
+                    # Snapshot health before enemy updates so we can detect hurt
+                    prev_health = player.health
 
                     # Update the world (animates portal gate and water tiles)
                     world.update()
 
                     # Update normal enemies — they wander, chase, and attack.
-                    # Also check if any just died and should drop a shard.
                     for enemy in enemy_list:
                         enemy.update(player)
-                        # just_died is True (60% chance) on the single frame an enemy dies
-                        if enemy.just_died:
-                            item_list.append(MagicalShard(enemy.x, enemy.y))
+                        # If the enemy just landed a hit, show a red flash at the player!
+                        # This makes enemy attacks VISIBLE — you can see and feel the hit.
+                        if enemy.just_attacked:
+                            player_hit_rect = pygame.Rect(
+                                player.x, player.y,
+                                player.sprite_width, player.sprite_height,
+                            )
+                            attack_effects.append(AttackEffect([player_hit_rect], "enemy_melee"))
 
                     # Update mini-bosses and check if they've been permanently defeated
                     for boss in miniboss_list:
                         boss.update(player)
+                        # Same red flash when a mini-boss hits — they hit harder, same visual cue
+                        if boss.just_attacked:
+                            player_hit_rect = pygame.Rect(
+                                player.x, player.y,
+                                player.sprite_width, player.sprite_height,
+                            )
+                            attack_effects.append(AttackEffect([player_hit_rect], "enemy_melee"))
+
+                    # Grimrak ground slam — deals 3 HP if the player is in the orange zone
+                    for boss in miniboss_list:
+                        if hasattr(boss, "slam_active") and boss.slam_active > 0:
+                            slam_rect = pygame.Rect(boss.x - 25, boss.y - 25, 130, 130)
+                            player_rect = pygame.Rect(
+                                player.x, player.y, player.sprite_width, player.sprite_height
+                            )
+                            if slam_rect.colliderect(player_rect):
+                                player.take_damage(3)
+                                sounds.play_hurt()
+
+                    # Collect any new projectiles Zara (or future bosses) just fired
+                    for boss in miniboss_list:
+                        if hasattr(boss, "pending_projectiles"):
+                            enemy_proj_list.extend(boss.pending_projectiles)
+
+                    # ── Auto-dismiss the portal intro splash after 3 seconds ───
+                    if portal_overlay_active:
+                        portal_overlay_timer -= 1
+                        if portal_overlay_timer <= 0:
+                            portal_overlay_active = False
+
+                    # ── Update Voltrak — the final boss! ────────────────────
+                    # We skip his update while the intro splash is showing so the
+                    # player gets a few seconds to read it before the fight starts.
+                    for voltrak in voltrak_list:
+                        if voltrak.is_permanently_dead() or portal_overlay_active:
+                            continue
+                        voltrak.update(player)
+
+                        # Did any shock bolts just fire? Check if the player is standing in one!
+                        # Shock damage is checked the frame the bolts appear — then zones stay
+                        # visible but no longer deal damage (so the player can dodge next volley).
+                        if voltrak.shock_just_fired:
+                            player_rect = pygame.Rect(player.x, player.y,
+                                                      player.sprite_width, player.sprite_height)
+                            for zone_entry in voltrak.shock_zones:
+                                zone_rect = zone_entry[0]
+                                if zone_rect.colliderect(player_rect):
+                                    player.take_damage(voltrak.SHOCK_DAMAGE)
+                                    sounds.play_hurt()
+                                    break   # One shock hit per volley — don't stack all 4 bolts
+
+                        # Did Voltrak just die during this update? (e.g. from damage-over-time)
+                        if voltrak.just_died:
+                            voltrak_defeated = True
+
+                    # Victory condition: if the arena boss is dead, show the victory screen.
+                    if voltrak_list and voltrak_list[0].is_permanently_dead():
+                        voltrak_defeated = True
+
+                    # Move enemy projectiles and check if they hit the player
+                    player_rect = pygame.Rect(
+                        player.x, player.y, player.sprite_width, player.sprite_height
+                    )
+                    for proj in enemy_proj_list[:]:
+                        proj.update()
+                        if not proj.alive:
+                            enemy_proj_list.remove(proj)
+                            continue
+                        if proj.get_rect().colliderect(player_rect):
+                            player.take_damage(proj.damage)
+                            sounds.play_hurt()
+                            proj.alive = False
+                            enemy_proj_list.remove(proj)
+
+                    # ── Hurt detection ──────────────────────────────────────
+                    # If health dropped during enemy updates, play the hurt sound
+                    if player.health < prev_health:
+                        sounds.play_hurt()
 
                     # Has Grimrak been beaten for the first time?
                     if (not miniboss1_defeated
@@ -689,6 +1293,9 @@ async def main():
                             and isinstance(miniboss_list[0], Grimrak)
                             and miniboss_list[0].is_permanently_dead()):
                         miniboss1_defeated = True
+                        # If Zara hasn't spawned yet, go back to exploration music
+                        if not zara_spawned:
+                            sounds.play_exploration_music()
 
                     # Has Zara been beaten for the first time?
                     if (not miniboss2_defeated
@@ -696,6 +1303,8 @@ async def main():
                             and isinstance(miniboss_list[1], Zara)
                             and miniboss_list[1].is_permanently_dead()):
                         miniboss2_defeated = True
+                        sounds.play_exploration_music()
+                        summoner.notify_bosses_beaten()
 
                     # Drop the portal key ONCE when BOTH mini-bosses are defeated!
                     if (miniboss1_defeated and miniboss2_defeated and not portal_key_spawned):
@@ -708,38 +1317,129 @@ async def main():
                         grimrak_spawned = True
                         gx, gy = GRIMRAK_SPAWN_POS
                         miniboss_list.append(Grimrak(gx, gy))
+                        sounds.play_grimrak_music()
 
                     # Spawn Zara at 50 shards collected (only once!)
                     if player.shards_collected >= ZARA_SPAWN_SHARDS and not zara_spawned:
                         zara_spawned = True
                         zx, zy = ZARA_SPAWN_POS
                         miniboss_list.append(Zara(zx, zy))
+                        sounds.play_zara_music()
 
                     # Update companions (they follow the player)
                     for companion in companions:
                         companion.update(player)
 
+                    # Update fighter companions (they actively attack nearby enemies/bosses)
+                    fighter_targets = miniboss_list + voltrak_list
+                    for fighter in fighter_companions:
+                        fighter.update(player, enemy_list, fighter_targets)
+
                     # Update villagers (they show speech bubbles when nearby)
                     for villager in villagers:
                         villager.update(player)
+
+                    # Update summoner hint bubble timing
+                    summoner.update(player)
 
                     # Check if the player walked over any items and collected them.
                     # item_list[:] is a copy — safe to remove items while looping!
                     for item in item_list[:]:
                         item.update()
                         if item.check_collection(player):
-                            # If the player picked up the portal key, mark it
-                            if isinstance(item, PortalKey):
-                                pass   # player.has_portal_key is set inside PortalKey._on_collected
+                            # Play the right collection sound based on what was picked up
+                            if isinstance(item, MagicalShard):
+                                sounds.play("collect_shard")
+                            elif isinstance(item, HealthPotion):
+                                sounds.play("collect_health")
+                            elif isinstance(item, BigHealthPotion):
+                                sounds.play("collect_health")   # Big golden heal — same jingle!
+                            elif isinstance(item, PortalKey):
+                                sounds.play("collect_portal_key")
+                                # player.has_portal_key is set inside PortalKey._on_collected
                             item_list.remove(item)
 
                     # Did the player earn a level-up from their last shard pickup?
                     if player.level_up_pending:
                         level_up_active = True
+                        sounds.play_level_up_fanfare()
+
+                    # ── Update all flying projectiles ───────────────────────
+                    # Shurikens and lasers move each frame and disappear when they
+                    # hit an enemy or travel too far (600 px).
+                    for proj in projectile_list[:]:   # copy the list since we may remove items
+                        proj.update()
+                        if not proj.alive:
+                            projectile_list.remove(proj)
+                            continue
+                        proj_rect = proj.get_rect()
+
+                        hit_something = False
+
+                        # Check if the projectile hit any regular enemy
+                        for enemy in enemy_list:
+                            if not enemy.is_dead():
+                                enemy_rect = pygame.Rect(enemy.x, enemy.y,
+                                                         enemy.sprite_width, enemy.sprite_height)
+                                if proj_rect.colliderect(enemy_rect):
+                                    enemy.take_damage(proj.damage)
+                                    sounds.play("attack_hit")
+                                    if enemy.just_died:
+                                        item_list.append(MagicalShard(enemy.x, enemy.y))
+                                    if enemy.potion_drop:
+                                        item_list.append(HealthPotion(enemy.x, enemy.y))
+                                    proj.alive = False
+                                    hit_something = True
+                                    break   # One projectile = one enemy hit
+
+                        # If it didn't hit a regular enemy, check mini-bosses
+                        if not hit_something:
+                            for boss in miniboss_list:
+                                if not boss.is_permanently_dead():
+                                    boss_rect = pygame.Rect(boss.x, boss.y,
+                                                            boss.sprite_width, boss.sprite_height)
+                                    if proj_rect.colliderect(boss_rect):
+                                        boss.take_damage(proj.damage)
+                                        sounds.play("attack_hit")
+                                        if boss.just_died:
+                                            item_list.append(MagicalShard(boss.x, boss.y))
+                                        if boss.boss_potion_drop:
+                                            item_list.append(BigHealthPotion(boss.x, boss.y))
+                                        proj.alive = False
+                                        hit_something = True
+                                        break
+
+                        # If it didn't hit a mini-boss either, check Voltrak!
+                        if not hit_something:
+                            for voltrak in voltrak_list:
+                                if voltrak.is_permanently_dead():
+                                    continue
+                                voltrak_rect = pygame.Rect(voltrak.x, voltrak.y,
+                                                           voltrak.sprite_width, voltrak.sprite_height)
+                                if proj_rect.colliderect(voltrak_rect):
+                                    voltrak.take_damage(proj.damage)
+                                    sounds.play("attack_hit")
+                                    # Check for victory right after the hit!
+                                    if voltrak.just_died:
+                                        voltrak_defeated = True
+                                    proj.alive = False
+                                    hit_something = True
+                                    break
+
+                        # Remove the projectile if it hit something
+                        if not proj.alive and proj in projectile_list:
+                            projectile_list.remove(proj)
+
+                    # ── Update melee attack effect timers ───────────────────
+                    # Each effect counts down and removes itself when done.
+                    for fx in attack_effects[:]:
+                        fx.update()
+                        if not fx.alive:
+                            attack_effects.remove(fx)
 
             # ── Draw ───────────────────────────────────────
             # Layers: world → items → villagers → enemies → mini-bosses
-            #         → companions → player → HUD → overlays
+            #         → companions → player → projectiles → effects → HUD → overlays
 
             # 1. Draw the tile world (grass, paths, trees, portal gate)
             world.draw(screen)
@@ -752,6 +1452,9 @@ async def main():
             for villager in villagers:
                 villager.draw(screen, npc_font)
 
+            # 3b. Draw the Summoner NPC
+            summoner.draw(screen, npc_font)
+
             # 4. Draw regular enemies (with health bars)
             for enemy in enemy_list:
                 enemy.draw(screen)
@@ -760,57 +1463,139 @@ async def main():
             for boss in miniboss_list:
                 boss.draw(screen)
 
+            # 5a. Draw Grimrak's slam zone (orange danger area) while active.
+            for boss in miniboss_list:
+                if hasattr(boss, "slam_active") and boss.slam_active > 0:
+                    alpha = int(160 * boss.slam_active / 20)
+                    slam_warning_surf.fill((255, 140, 0, alpha))
+                    screen.blit(slam_warning_surf, (boss.x - 25, boss.y - 25))
+
+            # 5b. Draw Voltrak (the final boss) and his electric shock zones
+            for voltrak in voltrak_list:
+                if not voltrak.is_permanently_dead():
+                    voltrak.draw(screen)       # Sprite + small health bar above
+                    voltrak.draw_shocks(screen)   # Electric bolt zones glowing on the ground
+
+            # 5c. Draw enemy projectiles (Zara bolts) between boss and companion layers.
+            for proj in enemy_proj_list:
+                proj.draw(screen)
+
             # 6. Draw companion NPCs on top of enemies
             for companion in companions:
                 companion.draw(screen)
+            for fighter in fighter_companions:
+                fighter.draw(screen)
 
             # 7. Draw the player on top of everything in the world
             player.draw(screen)
 
-            # 8. Draw the HUD (health, endurance, strength, magic bars + portrait)
+            # 8. Draw ranged projectiles — shurikens and laser blasts!
+            for proj in projectile_list:
+                proj.draw(screen)
+
+            # 9. Draw melee attack flash effects — brief coloured zones showing hit areas
+            for fx in attack_effects:
+                fx.draw(screen)
+
+            # 10. Draw the HUD (health, endurance, strength, magic bars + portrait)
             draw_hud(screen, player, hud_font)
 
-            # 9. Shard counter and level — top-right corner
+            # 11. Shard counter and level — top-right corner
             shard_text = hud_font.render(
                 f"Shards: {player.shards_collected}   LVL {player.level}", True, (26, 188, 156))
             screen.blit(shard_text, (SCREEN_WIDTH - shard_text.get_width() - 12, 12))
 
-            # 10. Show how many more shards until the next boss spawns
-            if not grimrak_spawned:
-                shards_needed = GRIMRAK_SPAWN_SHARDS - player.shards_collected
-                boss_hint = hud_font.render(
-                    f"Collect {shards_needed} more shards to awaken Grimrak!", True, (255, 200, 100))
-                screen.blit(boss_hint,
-                    (SCREEN_WIDTH // 2 - boss_hint.get_width() // 2, SCREEN_HEIGHT - 30))
-            elif not zara_spawned:
-                shards_needed = ZARA_SPAWN_SHARDS - player.shards_collected
-                boss_hint = hud_font.render(
-                    f"Collect {shards_needed} more shards to awaken Zara!", True, (200, 150, 255))
-                screen.blit(boss_hint,
-                    (SCREEN_WIDTH // 2 - boss_hint.get_width() // 2, SCREEN_HEIGHT - 30))
+            # 11b. Lives counter — top-right under shard text
+            lives_text = hud_font.render(f"Lives: {lives_remaining}", True, (245, 200, 66))
+            screen.blit(lives_text, (SCREEN_WIDTH - lives_text.get_width() - 12, 34))
 
-            # 11. Portal key indicator — shows if the player is carrying it
+            # 12. Show how many more shards until the next boss spawns (only in the overworld).
+            if not arena_mode:
+                if not grimrak_spawned:
+                    shards_needed = GRIMRAK_SPAWN_SHARDS - player.shards_collected
+                    boss_hint = hud_font.render(
+                        f"Collect {shards_needed} more shards to awaken Grimrak!", True, (255, 200, 100))
+                    screen.blit(boss_hint,
+                        (SCREEN_WIDTH // 2 - boss_hint.get_width() // 2, SCREEN_HEIGHT - 30))
+                elif not zara_spawned:
+                    shards_needed = ZARA_SPAWN_SHARDS - player.shards_collected
+                    boss_hint = hud_font.render(
+                        f"Collect {shards_needed} more shards to awaken Zara!", True, (200, 150, 255))
+                    screen.blit(boss_hint,
+                        (SCREEN_WIDTH // 2 - boss_hint.get_width() // 2, SCREEN_HEIGHT - 30))
+
+            # 13. Portal key indicator and proximity prompts
             if player.has_portal_key and not portal_open:
-                key_hint = hud_font.render(
-                    "[ Portal Key collected — walk to the gate to open it! ]", True, HERO_GOLD)
+                # Check if the player is close enough to the portal gate
+                portal_rect   = pygame.Rect(PORTAL_X, PORTAL_Y, 96, 128)
+                player_rect   = pygame.Rect(player.x, player.y,
+                                            player.sprite_width, player.sprite_height)
+                near_portal   = portal_rect.inflate(40, 40).colliderect(player_rect)
+
+                if near_portal:
+                    # Player is RIGHT NEXT to the gate — show "Press E" prompt
+                    key_hint = hud_font.render(
+                        "[ Press E to enter the portal! ]", True, HERO_GOLD)
+                else:
+                    # Player has the key but isn't near the gate yet
+                    key_hint = hud_font.render(
+                        "[ Portal Key collected — walk to the gate to open it! ]", True, HERO_GOLD)
                 screen.blit(key_hint,
                     (SCREEN_WIDTH // 2 - key_hint.get_width() // 2, SCREEN_HEIGHT - 50))
 
-            # 12. ESC hint in the bottom-right corner
+            # 13b. Voltrak boss bar — shown at the top-centre while the fight is active
+            if voltrak_list and not voltrak_list[0].is_permanently_dead() and not portal_overlay_active:
+                draw_voltrak_boss_bar(screen, voltrak_list[0], voltrak_bar_font)
+
+            # 13c. Portal intro splash — shown once when the portal opens.
+            # Auto-dismisses after 3 seconds, or press ESC to skip right into the fight!
+            if portal_overlay_active:
+                overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+                overlay.fill((80, 0, 120, 200))   # Deep purple, semi-transparent
+                screen.blit(overlay, (0, 0))
+                boss_title = hint_font.render(
+                    "THE PORTAL IS OPEN!", True, HERO_GOLD)
+                boss_sub   = hint_font.render(
+                    "Voltrak the Shockblade Eel has emerged!", True, (220, 180, 255))
+                boss_fight = hint_font.render(
+                    "FIGHT FOR LUMORIA!", True, (255, 200, 100))
+                dismiss_hint = hint_font.render(
+                    "Press ESC to begin the battle!", True, (200, 200, 200))
+                screen.blit(boss_title,
+                    (SCREEN_WIDTH // 2 - boss_title.get_width() // 2, SCREEN_HEIGHT // 2 - 60))
+                screen.blit(boss_sub,
+                    (SCREEN_WIDTH // 2 - boss_sub.get_width() // 2, SCREEN_HEIGHT // 2 - 20))
+                screen.blit(boss_fight,
+                    (SCREEN_WIDTH // 2 - boss_fight.get_width() // 2, SCREEN_HEIGHT // 2 + 16))
+                screen.blit(dismiss_hint,
+                    (SCREEN_WIDTH // 2 - dismiss_hint.get_width() // 2, SCREEN_HEIGHT // 2 + 60))
+
+            # 14. ESC hint in the bottom-right corner
             draw_esc_hint(screen, hint_font)
 
-            # 13. Pause overlay (on top of the game)
+            # 15. Pause overlay (on top of the game)
             if game_paused:
                 draw_pause_overlay(screen, pause_fonts, pause_surfaces,
                                    audio_enabled, selected_setting_index)
 
-            # 14. Death screen — on top of even the pause overlay
+            # 16. Death screen — on top of even the pause overlay
             if player.is_dead_flag:
-                draw_death_screen(screen, death_font)
+                draw_death_screen(screen, death_font, lives_remaining)
 
-            # 15. Level-up overlay — the topmost layer of all
+            # 17. Level-up overlay — the topmost layer of all (unless you've just won!)
             if level_up_active:
                 draw_level_up_overlay(screen, player, level_up_fonts, level_up_surfaces)
+
+            # 18. Victory screen — shown when Voltrak is defeated. Nothing else matters now!
+            if voltrak_defeated:
+                draw_victory_screen(screen, victory_title_font, victory_body_font)
+
+            # 19. Game-over screen — shown after all lives are spent.
+            if game_over_lives:
+                draw_game_over_screen(screen, victory_title_font, victory_body_font)
+
+            # ── Advance audio timers ────────────────────────
+            sounds.tick()
 
             # ── Show the Frame ─────────────────────────────
             pygame.display.flip()
